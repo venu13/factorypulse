@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+*credentials*.json
+application_default_credentials.json
+# Data & outputs
+data/
+reports/*.tmp
+*.mat
+*.pdf
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

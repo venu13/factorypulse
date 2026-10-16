@@ -1,0 +1,8 @@
+google-genai==1.20.0
+streamlit==1.45.1
+plotly==6.1.2
+pandas==2.2.3
+numpy==2.2.6
+pydantic==2.11.5
+pillow==11.2.1
+fpdf2==2.8.3
