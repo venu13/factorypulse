@@ -6,3 +6,5 @@ numpy==2.2.6
 pydantic==2.11.5
 pillow==11.2.1
 fpdf2==2.8.3
+google-cloud-bigquery==3.46.2
+google-cloud-storage==3.17.1

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from copilot import (
     work_order_to_json,
     work_order_to_pdf,
 )
+import cloud
 from diagnostics import describe_environment, run_preflight
 from inspector import (
     SAMPLE_KINDS,
@@ -102,6 +104,9 @@ if "initialized" not in st.session_state:
     st.session_state.inspections = {}
     st.session_state.work_orders = {}
     st.session_state.chats = {}
+    st.session_state.session_id = uuid.uuid4().hex[:12]
+    st.session_state.store = cloud.make_store()
+    st.session_state.logged_keys = set()
     for m in FLEET:
         st.session_state[f"mode_{m['id']}"] = m["mode"].value
         st.session_state[f"sev_{m['id']}"] = 1.0
@@ -156,6 +161,46 @@ def prov_details(prov: Dict[str, Any]) -> None:
         st.caption(f'Offline mock result - {prov["reason"]}.')
 
 
+def show_store_warnings() -> None:
+    """Surface (never raise) any GCS / BigQuery problems collected so far."""
+    for w in st.session_state.store.pop_warnings() + st.session_state.pop("gcs_warnings", []):
+        st.warning(f"☁️ {w} - continuing without it.")
+
+
+def gcs_save(blob: str, data: bytes, content_type: str) -> Optional[str]:
+    uri, warn = cloud.save_to_gcs(blob, data, content_type)
+    if warn:
+        st.session_state.setdefault("gcs_warnings", []).append(warn)
+    return uri
+
+
+def log_fleet_once() -> None:
+    """Log each distinct (machine, fault, severity, seed, window) telemetry state once per session."""
+    store, seen = st.session_state.store, st.session_state.logged_keys
+    snaps: List[dict] = []
+    flags: List[dict] = []
+    for m in FLEET:
+        mid = m["id"]
+        key = (mid, st.session_state[f"mode_{mid}"], float(st.session_state[f"sev_{mid}"]),
+               st.session_state.seed_bump, st.session_state.dur_min)
+        if key in seen:
+            continue
+        seen.add(key)
+        df, _, rep = current_data(mid)
+        onset = df.loc[df["fault_label"], "timestamp"].min() if df["fault_label"].any() else None
+        sr, fr = cloud.build_snapshot_rows(st.session_state.session_id, mid, rep, key[1], key[2], onset)
+        snaps += sr
+        flags += fr
+    if snaps:
+        store.insert("telemetry_snapshots", snaps)
+        store.insert("anomaly_flags", flags)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def bigquery_analytics(dataset: str, _store) -> Dict[str, pd.DataFrame]:
+    return _store.analytics()
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
@@ -189,6 +234,8 @@ with st.sidebar:
         if st.session_state.get("preflight"):
             st.dataframe(pd.DataFrame(st.session_state.preflight)[["check", "result", "provenance", "latency_ms", "detail"]],
                          hide_index=True, use_container_width=True)
+    st.caption(f"Storage: {'gs://' + cloud.gcs_bucket() if cloud.gcs_bucket() else 'Cloud Storage off'} · "
+               f"{st.session_state.store.label}")
     st.divider()
     st.caption("Simulated plant: 6 rotating assets, 5 s sampling. Inject faults in the **Telemetry Explorer** tab.")
     if st.button("🎲 Re-roll sensor noise", use_container_width=True):
@@ -211,6 +258,8 @@ tab_overview, tab_telemetry, tab_qa, tab_copilot = st.tabs(
 # --------------------------------------------------------------------------- #
 with tab_overview:
     reports = fleet_reports()
+    log_fleet_once()
+    show_store_warnings()
     statuses = [r["status"] for r in reports.values()]
     avg_health = sum(r["health_score"] for r in reports.values()) / len(reports)
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -278,6 +327,58 @@ with tab_overview:
         margin=dict(l=10, r=10, t=30, b=10), title="Asset health score", yaxis=dict(range=[0, 115], gridcolor="#222B38"),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Fleet analytics (BigQuery, or in-memory pandas equivalent) ------------------------- #
+    st.subheader("Fleet analytics")
+    store = st.session_state.store
+    analytics, source_label = None, store.label
+    if store.is_bigquery:
+        if st.button("↻ Refresh BigQuery analytics", key="bq_refresh"):
+            bigquery_analytics.clear()
+        try:
+            analytics = bigquery_analytics(store.label, store)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"☁️ BigQuery analytics failed ({type(exc).__name__}: {exc}). Showing local data instead.")
+            from cloud import LocalStore
+            local = LocalStore()
+            local.tables = {t: [] for t in cloud.SCHEMAS}
+            analytics, source_label = local.analytics(), "local mode (BigQuery unavailable)"
+    else:
+        analytics = store.analytics()
+    st.caption(f"Data source: **{source_label}** · rows logged this and other sessions; telemetry is simulated "
+               "and fault onset is the simulator's ground truth.")
+    a1, a2, a3 = st.columns(3)
+    apd, mttd, wbc = (analytics["anomalies_per_day"], analytics["mean_time_to_detect"],
+                      analytics["work_orders_by_criticality"])
+    chart_layout = dict(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#121821", height=300,
+                        margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    with a1:
+        if len(apd):
+            f1 = go.Figure([go.Bar(name=mid, x=g["day"].astype(str), y=g["anomalies"]) for mid, g in apd.groupby("machine_id")])
+            f1.update_layout(title="Anomaly flags per machine per day", barmode="stack", **chart_layout)
+            st.plotly_chart(f1, use_container_width=True)
+        else:
+            st.info("No anomaly flags logged yet.")
+    with a2:
+        if len(mttd):
+            f2 = go.Figure(go.Bar(x=mttd["machine_id"], y=mttd["mean_detect_lag_s"] / 60.0, marker_color=BLUE,
+                                  text=[f"n={int(n)}" for n in mttd["n"]]))
+            f2.update_layout(title="Mean time to detect (min after fault onset)", **chart_layout)
+            st.plotly_chart(f2, use_container_width=True)
+        else:
+            st.info("No detections with a known fault onset yet.")
+    with a3:
+        if len(wbc):
+            order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+            f3 = go.Figure([
+                go.Bar(name=k, x=g["criticality"], y=g["work_orders"])
+                for k, g in wbc.groupby("provenance_kind")
+            ])
+            f3.update_xaxes(categoryorder="array", categoryarray=order)
+            f3.update_layout(title="Work orders by criticality / provenance", barmode="stack", **chart_layout)
+            st.plotly_chart(f3, use_container_width=True)
+        else:
+            st.info("No work orders generated yet.")
 
 
 # --------------------------------------------------------------------------- #
@@ -428,9 +529,14 @@ with tab_qa:
             annotated = annotate_image(image_bytes, report_obj)
             buf = io.BytesIO()
             annotated.save(buf, format="PNG")
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            gcs_paths = {
+                "original": gcs_save(f"inspections/{qa_machine}/{stamp}_original.png", image_bytes, "image/png"),
+                "annotated": gcs_save(f"inspections/{qa_machine}/{stamp}_annotated.png", buf.getvalue(), "image/png"),
+            }
             st.session_state.inspections[qa_machine] = {
                 "report": report_obj.model_dump(mode="json"), "prov": prov.to_dict(),
-                "original": image_bytes, "annotated": buf.getvalue(),
+                "original": image_bytes, "annotated": buf.getvalue(), "gcs": gcs_paths,
                 "at": datetime.now().strftime("%H:%M:%S"),
             }
             st.session_state.work_orders.pop(qa_machine, None)
@@ -451,6 +557,9 @@ with tab_qa:
             m3.metric("Defects found", len(rep["defects"]), delta=f'at {rec["at"]}', delta_color="off")
             st.markdown("Provenance: " + prov_badge(rec["prov"]), unsafe_allow_html=True)
             prov_details(rec["prov"])
+            show_store_warnings()
+            if rec["gcs"].get("annotated"):
+                st.caption(f'Saved to Cloud Storage: `{rec["gcs"]["original"]}` and `{rec["gcs"]["annotated"]}`')
             tab_a, tab_b = st.tabs(["Gemini annotated", "Original"])
             tab_a.image(rec["annotated"], use_container_width=True)
             tab_b.image(rec["original"], use_container_width=True)
@@ -506,11 +615,17 @@ with tab_copilot:
             inspection_obj = InspectionReport.model_validate(insp_rec["report"]) if (insp_rec and include_insp) else None
             with st.spinner("Correlating telemetry, vision and SOPs..."):
                 wo, prov = generate_work_order(cp_machine, anomaly, inspection_obj, use_mock=use_mock)
-            st.session_state.work_orders[cp_machine] = {
-                "wo": wo, "prov": prov.to_dict(), "sig": sig_for(cp_machine),
-                "meta": {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "provenance": prov.label,
+            meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "provenance": prov.label,
                          "provenance_detail": prov.to_dict(), "safety_notes": prov.notes,
-                         "telemetry_status": anomaly["status"], "inspection_attached": inspection_obj is not None},
+                         "telemetry_status": anomaly["status"], "inspection_attached": inspection_obj is not None}
+            pdf_bytes, json_text = work_order_to_pdf(wo, meta), work_order_to_json(wo, meta)
+            pdf_uri = gcs_save(f"work_orders/{wo.incident_id}.pdf", pdf_bytes, "application/pdf")
+            json_uri = gcs_save(f"work_orders/{wo.incident_id}.json", json_text.encode(), "application/json")
+            st.session_state.store.insert("work_orders", [
+                cloud.build_work_order_row(st.session_state.session_id, wo, prov.to_dict(), pdf_uri, json_uri)])
+            st.session_state.work_orders[cp_machine] = {
+                "wo": wo, "prov": prov.to_dict(), "sig": sig_for(cp_machine), "meta": meta,
+                "pdf": pdf_bytes, "json": json_text, "gcs": {"pdf": pdf_uri, "json": json_uri},
             }
 
         rec_wo = st.session_state.work_orders.get(cp_machine)
@@ -537,10 +652,13 @@ with tab_copilot:
             with st.expander("Remediation procedure", expanded=True):
                 for i, step in enumerate(wo.remediation_steps, 1):
                     st.markdown(f"{i}. {step}")
+            show_store_warnings()
+            if rec_wo["gcs"]["pdf"]:
+                st.caption(f'Saved to Cloud Storage: `{rec_wo["gcs"]["pdf"]}` · `{rec_wo["gcs"]["json"]}`')
             e1, e2 = st.columns(2)
-            e1.download_button("📄 Export PDF", work_order_to_pdf(wo, rec_wo["meta"]), file_name=f"{wo.incident_id}.pdf",
+            e1.download_button("📄 Export PDF", rec_wo["pdf"], file_name=f"{wo.incident_id}.pdf",
                                mime="application/pdf", use_container_width=True)
-            e2.download_button("🧾 Export JSON", work_order_to_json(wo, rec_wo["meta"]), file_name=f"{wo.incident_id}.json",
+            e2.download_button("🧾 Export JSON", rec_wo["json"], file_name=f"{wo.incident_id}.json",
                                mime="application/json", use_container_width=True)
 
     with p2:
