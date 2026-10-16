@@ -4,10 +4,9 @@ Correlates anomaly telemetry and visual inspection findings with SOPs to produce
 schema-enforced WorkOrder via Gemini structured outputs, and powers a tool-calling
 root-cause chat. A deterministic rule-based engine provides an offline fallback.
 """
-from __future__ import annotations
-
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -33,6 +32,24 @@ CRITICALITY_LEVELS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 # --------------------------------------------------------------------------- #
 # Output schema
 # --------------------------------------------------------------------------- #
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_BROKEN_DEGREE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f](?=[CF]\b)")
+
+
+def clean_text(v):
+    """Strip control characters the model sometimes emits (seen live: '71.0 \\x10C' for '71.0 °C')."""
+    if isinstance(v, str):
+        return _CTRL.sub("", _BROKEN_DEGREE.sub("°", v))
+    if isinstance(v, list):
+        return [clean_text(x) for x in v]
+    return v
+
+
+def format_rul(hours: float) -> str:
+    """Human-readable RUL; 0 means 'act now', not a data error."""
+    return "0.0 h (immediate - failure imminent)" if hours <= 0 else f"{hours:.1f} h"
+
+
 class WorkOrder(BaseModel):
     incident_id: str
     machine_id: str
@@ -43,6 +60,11 @@ class WorkOrder(BaseModel):
     required_parts: List[str]
     loto_procedure_required: bool
     remediation_steps: List[str]
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_control_chars(cls, v):
+        return clean_text(v)
 
     @field_validator("criticality")
     @classmethod
@@ -250,8 +272,10 @@ Rules:
 - Ground every claim in the supplied telemetry numbers, inspection findings or SOP text; cite SOP document numbers.
 - criticality must be exactly LOW, MEDIUM, HIGH or CRITICAL. Use CRITICAL when failure is likely within a shift
   or a safety-relevant crack exists; HIGH if action is needed within 72 h.
-- estimated_remaining_useful_life_hours must be a defensible number given the trend (use hours_to_temp_critical
-  when provided); never return a negative number.
+- estimated_remaining_useful_life_hours must be a defensible number given the trend (hours_to_temp_critical, when
+  provided, is an upper bound for temperature-driven failure). Never return a negative number. If failure is imminent
+  give the smallest defensible positive value (at least 0.5); return 0 only if the asset has already failed.
+- Write temperatures with the degree sign (for example "71.1 °C"); do not emit control characters.
 - required_parts must use catalogue part numbers from the SOPs, formatted "PART-NO - description (qty N)".
 - loto_procedure_required must be true for any intervention on rotating or energised equipment.
 - remediation_steps must be ordered, imperative, and begin with the lock-out/tag-out sequence when LOTO is required,
@@ -298,6 +322,10 @@ def _apply_guardrails(
     data["machine_id"] = machine_id
     rul = max(0.0, round(float(data["estimated_remaining_useful_life_hours"]), 1))
     data["estimated_remaining_useful_life_hours"] = rul
+    if rul <= 0:
+        h = anomaly.get("snapshot", {}).get("derived", {}).get("hours_to_temp_critical")
+        extra = f"; telemetry projects {h} h to the bearing-temperature limit" if h else ""
+        notes.append(f"Remaining useful life reported as 0 h - treat as act-now{extra}.")
     if CRITICALITY_LEVELS.index(data["criticality"]) >= 2 and not data["loto_procedure_required"]:
         data["loto_procedure_required"] = True
         notes.append("Safety floor: lock-out/tag-out forced to REQUIRED because criticality is HIGH or CRITICAL.")
@@ -348,10 +376,10 @@ def _triage_gemini(
     prompt = (
         f"Machine: {machine_id}\n"
         f"Suggested incident_id: {_incident_id(machine_id, anomaly)}\n\n"
-        f"## Telemetry anomaly report (JSON)\n{json.dumps(anomaly, indent=2, default=str)}\n\n"
+        f"## Telemetry anomaly report (JSON)\n{json.dumps(anomaly, indent=2, default=str, ensure_ascii=False)}\n\n"
         f"## Visual inspection report (JSON)\n"
         f"{inspection.model_dump_json(indent=2) if inspection else 'No visual inspection available.'}\n\n"
-        f"## Retrieved SOPs and parts (JSON)\n{json.dumps(sops, indent=2)}\n\n"
+        f"## Retrieved SOPs and parts (JSON)\n{json.dumps(sops, indent=2, ensure_ascii=False)}\n\n"
         "Produce the work order."
     )
     config = types.GenerateContentConfig(
@@ -674,7 +702,7 @@ def work_order_to_pdf(wo: WorkOrder, meta: Optional[Dict[str, Any]] = None) -> b
     pdf.set_text_color(255, 255, 255)
     pdf.cell(34, 8, wo.criticality, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(20, 20, 20)
-    kv("Est. remaining useful life", f"{wo.estimated_remaining_useful_life_hours:.1f} hours")
+    kv("Est. remaining useful life", format_rul(wo.estimated_remaining_useful_life_hours))
     kv("LOTO required", "YES - lock-out/tag-out mandatory" if wo.loto_procedure_required else "No")
 
     heading("Root cause analysis")

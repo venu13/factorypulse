@@ -174,7 +174,8 @@ def is_retryable(exc: BaseException) -> bool:
     try:
         import httpx
 
-        return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError))
+        # TransportError covers timeouts, connect/read errors, proxy errors and protocol errors: all transient.
+        return isinstance(exc, httpx.TransportError)
     except ImportError:  # pragma: no cover
         return False
 

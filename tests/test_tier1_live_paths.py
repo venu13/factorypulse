@@ -187,3 +187,59 @@ def test_cloud_run_never_defaults_to_mock(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "demo-proj")
     st = llm_status()
     assert st["mode"] == "vertex" and st["project"] == "demo-proj"
+
+
+# ---- regression: tool functions must carry REAL type annotations --------------- #
+def test_chat_tools_have_real_annotations_not_strings():
+    """Found live: `from __future__ import annotations` made hints strings and the SDK crashed
+    with 'isinstance() arg 2 must be a type' when executing the tool."""
+    import copilot
+
+    for fn in (copilot.lookup_sop, copilot.lookup_spare_part):
+        anns = fn.__annotations__
+        assert anns and all(not isinstance(a, str) for a in anns.values()), (fn.__name__, anns)
+    assert "from __future__ import annotations" not in open(copilot.__file__).read()
+
+
+# ---- regressions found in the first live Vertex run ----------------------------- #
+def test_control_characters_from_model_are_cleaned():
+    wo = WorkOrder.model_validate_json(_wo_json(root_cause_analysis="temp 71.1 \x10C and 62.7 \x10C \x07beep",
+                                                remediation_steps=["line1\nline2", "x\x01y"]))
+    assert "°C" in wo.root_cause_analysis and "\x10" not in wo.root_cause_analysis and "\x07" not in wo.root_cause_analysis
+    assert wo.remediation_steps == ["line1\nline2", "xy"]  # newline preserved
+
+
+def test_zero_rul_is_flagged_not_hidden(live_env, patch_client):
+    patch_client(FakeClient([_wo_json(criticality="CRITICAL", loto_procedure_required=True,
+                                      estimated_remaining_useful_life_hours=0.0)]))
+    wo, prov = generate_work_order("PUMP-1", _anomaly(), sleep=lambda s: None)
+    assert wo.estimated_remaining_useful_life_hours == 0.0  # model value is not silently altered
+    assert any("0 h" in n and "act-now" in n for n in prov.notes)
+    from copilot import format_rul
+    assert "immediate" in format_rul(0.0) and format_rul(5.04) == "5.0 h"
+
+
+def test_vision_call_disables_thinking_by_default(live_env, patch_client, monkeypatch):
+    monkeypatch.delenv("FACTORYPULSE_VISION_THINKING_BUDGET", raising=False)
+    client = patch_client(FakeClient([GOOD_INSPECTION]))
+    inspect_image(make_sample_image("gear"))
+    assert client.calls[0]["config"].thinking_config.thinking_budget == 0
+
+
+def test_vision_thinking_budget_is_configurable(live_env, patch_client, monkeypatch):
+    monkeypatch.setenv("FACTORYPULSE_VISION_THINKING_BUDGET", "default")
+    client = patch_client(FakeClient([GOOD_INSPECTION]))
+    inspect_image(make_sample_image("gear"))
+    assert client.calls[0]["config"].thinking_config is None
+
+
+def test_transient_transport_errors_are_retried():
+    """Found live: 'ProxyError: 503 Fail to connect with upstream proxy' was not retried."""
+    import httpx
+
+    for exc in (httpx.ProxyError("503 Fail to connect with upstream proxy"), httpx.ReadError("reset"),
+                httpx.ConnectTimeout("t"), httpx.ConnectError("c")):
+        assert is_retryable(exc), type(exc).__name__
+    client = FakeClient([httpx.ProxyError("503 Fail to connect with upstream proxy"), "ok"])
+    resp, attempts = generate_with_retry(client, model="m", contents="c", config=None, sleep=lambda s: None)
+    assert resp.text == "ok" and attempts == 2

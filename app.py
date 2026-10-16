@@ -18,6 +18,7 @@ from plotly.subplots import make_subplots
 from copilot import (
     WorkOrder,
     chat_reply,
+    format_rul,
     generate_work_order,
     work_order_to_json,
     work_order_to_pdf,
@@ -800,7 +801,7 @@ with tab_copilot:
                 f'<div class="fp-wo"><div class="fp-muted">{wo.incident_id}</div>'
                 f'<h3 style="margin:.1rem 0">{wo.failure_mode}</h3>'
                 f'{pill(wo.criticality, cc)} &nbsp;{pill("LOTO REQUIRED", RED) if wo.loto_procedure_required else pill("NO LOTO", GREEN)}'
-                f'<p style="margin-top:.7rem"><b>Remaining useful life:</b> {wo.estimated_remaining_useful_life_hours:.1f} h</p>'
+                f'<p style="margin-top:.7rem"><b>Remaining useful life:</b> {format_rul(wo.estimated_remaining_useful_life_hours)}</p>'
                 f'<p><b>Root cause analysis</b><br>{wo.root_cause_analysis}</p></div>',
                 unsafe_allow_html=True,
             )

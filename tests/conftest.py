@@ -36,7 +36,7 @@ class FakeClient:
 
         class _Models:
             def generate_content(self, model, contents, config):
-                outer.calls.append({"model": model, "contents": contents})
+                outer.calls.append({"model": model, "contents": contents, "config": config})
                 item = outer.script.pop(0)
                 if isinstance(item, BaseException):
                     raise item
