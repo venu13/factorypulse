@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime
@@ -31,6 +32,7 @@ from inspector import (
     SEVERITY_RANK,
     InspectionReport,
     annotate_image,
+    LOCALIZATION_NOTE,
     box_to_pixels,
     inspect_image,
     list_sample_gallery,
@@ -324,8 +326,12 @@ def run_triage(machine_id: str, include_inspection: bool = True) -> Dict[str, An
 
 
 def run_demo_scenario() -> None:
-    """Golden path for the demo video: fault -> anomaly -> inspection -> work order -> PDF export."""
+    """Golden path for the demo video: fault -> anomaly -> weld inspection -> work order -> PDF export.
+
+    Each slow Gemini call gets its own visible "calling Gemini..." line and live progress text.
+    """
     log: List[str] = []
+    live = not use_mock
     with st.status("Running demo scenario...", expanded=True) as status:
         bar = st.progress(0, text="Step 1/5 - injecting inner-race bearing fault")
         mid = DEMO_MACHINE
@@ -335,32 +341,42 @@ def run_demo_scenario() -> None:
             st.session_state.pop(wk, None)  # let the widgets re-initialise from cfg_*
         for k in ("explorer_machine", "qa_machine", "cp_machine"):
             st.session_state[k] = mid
-        st.session_state["qa_source"] = "bearing"
+        st.session_state["qa_source"] = "weld"
         log.append(f"1. Injected **inner race bearing defect** (severity 1.2) on {mid}.")
         st.write("✅ " + log[-1])
 
-        bar.progress(20, text="Step 2/5 - running anomaly detector")
+        bar.progress(15, text="Step 2/5 - running anomaly detector")
         _, _, rep = current_data(mid)
         top = rep["findings"][0]["message"] if rep["findings"] else "no findings"
         log.append(f"2. Detector status **{rep['status']}**, suspected **{fmt_mode(rep['suspected_mode'])}** "
                    f"({rep['mode_confidence']:.0%}); {len(rep['findings'])} finding(s). First: {top}")
         st.write("✅ " + log[-1])
 
-        bar.progress(40, text="Step 3/5 - visual inspection of bearing image")
-        rec = run_inspection(mid, make_sample_image("bearing"), "demo scenario: bearing race close-up")
-        log.append(f"3. Visual inspection: **{rec['report']['overall_condition']}**, {len(rec['report']['defects'])} defect(s) "
-                   f"[{rec['prov']['label']}].")
-        st.write("✅ " + log[-1])
+        # ---- slow call #1: Gemini vision ------------------------------------------------------ #
+        bar.progress(30, text="Step 3/5 - calling Gemini vision on the weld image (typically 5-20 s)..." if live
+                     else "Step 3/5 - visual inspection of the weld image (offline mock)")
+        ph = st.empty()
+        ph.markdown("⏳ **3.** Calling " + ("**Gemini vision** - this takes a few seconds..." if live else "offline mock inspector..."))
+        t0 = time.time()
+        rec = run_inspection(mid, make_sample_image("weld"), "demo scenario: weld seam on pump baseplate")
+        log.append(f"3. Weld inspection: **{rec['report']['overall_condition']}**, {len(rec['report']['defects'])} defect(s) "
+                   f"in {time.time() - t0:.1f} s [{rec['prov']['label']}].")
+        ph.markdown("✅ " + log[-1])
 
-        bar.progress(65, text="Step 4/5 - generating work order")
+        # ---- slow call #2: Gemini triage ------------------------------------------------------ #
+        bar.progress(60, text="Step 4/5 - calling Gemini to correlate telemetry, vision and SOPs (typically 10-30 s)..." if live
+                     else "Step 4/5 - generating work order (offline rule engine)")
+        ph = st.empty()
+        ph.markdown("⏳ **4.** Calling " + ("**Gemini** to build the work order - this is the slowest step..." if live else "offline rule engine..."))
+        t0 = time.time()
         wrec = run_triage(mid, True)
         wo = wrec["wo"]
         log.append(f"4. Work order **{wo.incident_id}**: criticality **{wo.criticality}**, RUL "
-                   f"{wo.estimated_remaining_useful_life_hours:.1f} h, LOTO {'required' if wo.loto_procedure_required else 'not required'} "
-                   f"[{wrec['prov']['label']}].")
-        st.write("✅ " + log[-1])
+                   f"{format_rul(wo.estimated_remaining_useful_life_hours)}, LOTO {'required' if wo.loto_procedure_required else 'not required'} "
+                   f"in {time.time() - t0:.1f} s [{wrec['prov']['label']}].")
+        ph.markdown("✅ " + log[-1])
 
-        bar.progress(90, text="Step 5/5 - preparing PDF export")
+        bar.progress(92, text="Step 5/5 - preparing PDF export")
         log.append(f"5. PDF export ready ({len(wrec['pdf']) // 1024} KB) - download below or in the Copilot tab.")
         st.write("✅ " + log[-1])
         bar.progress(100, text="Demo scenario complete")
@@ -381,9 +397,9 @@ with tab_overview:
     with st.container(border=True):
         d1, d2 = st.columns([1, 3])
         clicked = d1.button("▶ Run demo scenario", type="primary", use_container_width=True,
-                            help="Golden path: inject fault -> detect -> inspect -> work order -> PDF")
+                            help="Golden path: inject fault -> detect -> weld inspection -> work order -> PDF")
         d2.caption(f"One click runs the 3-minute video flow on **{DEMO_MACHINE}**: inject an inner-race bearing fault, "
-                   "show the anomaly flag, inspect a bearing image, generate the work order and enable PDF export.")
+                   "show the anomaly flag, inspect a weld image with Gemini, generate the work order with Gemini and enable PDF export (two live Gemini calls, ~20-40 s total).")
         if clicked:
             run_demo_scenario()
         if st.session_state.get("demo_log"):
@@ -742,6 +758,11 @@ with tab_qa:
             tab_a, tab_b = st.tabs(["Gemini annotated", "Original"])
             tab_a.image(rec["annotated"], use_container_width=True)
             tab_b.image(rec["original"], use_container_width=True)
+            if rec["prov"]["kind"] == "mock":
+                st.caption("ℹ️ Offline mock: boxes are the sample image's embedded ground truth (or a pseudo-estimate for other images), "
+                           "not model output.")
+            else:
+                st.caption("ℹ️ " + LOCALIZATION_NOTE)
             st.markdown(f'**{rep["component_type"].title()}** - {rep["summary"]}')
             if rep["defects"]:
                 ddf = pd.DataFrame(

@@ -119,6 +119,14 @@ class InspectionReport(BaseModel):
     summary: str
 
 
+# Measured live on gemini-2.5-flash (vision call, thinking off) against the synthetic samples' known defect boxes.
+LOCALIZATION_NOTE = (
+    "Box localization is approximate. Measured on synthetic samples, mean IoU was 0.45 for defects found with the "
+    "correct type (13 of 18 across 3 images x 3 runs; 0.32 counting misses as 0): about 0.5-0.6 for large features "
+    "(weld crack, heat tint) but 0.0-0.4 for small or subtle ones (gear wear patch, pitting clusters). "
+    "Confidence values are the model's own self-reported numbers, not calibrated probabilities."
+)
+
 SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 SEVERITY_COLOR = {
     "LOW": (80, 200, 120),

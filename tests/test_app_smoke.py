@@ -61,3 +61,19 @@ def test_demo_scenario_golden_path(at):
 def test_selftest_runs_in_mock_mode(at):
     _click(at, "self-test")
     assert not at.exception
+
+
+def test_demo_uses_weld_image_and_shows_per_call_progress(at):
+    _click(at, "Run demo scenario")
+    assert not at.exception
+    assert at.session_state["qa_source"] == "weld"
+    log = at.session_state.demo_log
+    assert "Weld inspection" in log[2] and " s [" in log[2]       # timed
+    assert "Work order" in log[3] and " s [" in log[3]
+    rec = at.session_state.inspections["PUMP-101"]
+    assert rec["report"]["component_type"] == "butt weld seam"
+
+
+def test_qa_lab_states_localization_is_approximate(at, monkeypatch):
+    from inspector import LOCALIZATION_NOTE
+    assert "approximate" in LOCALIZATION_NOTE and "not calibrated" in LOCALIZATION_NOTE and "0.45" in LOCALIZATION_NOTE
