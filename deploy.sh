@@ -67,6 +67,19 @@ if ! exists bq --project_id "${PROJECT_ID}" show --dataset "${PROJECT_ID}:${BQ_D
     --description "FactoryPulse telemetry, anomalies and work orders" "${PROJECT_ID}:${BQ_DATASET}"
 fi
 
+# Source deploys build as the project's default Compute Engine service account. New projects give it NO roles, which makes the
+# first build fail with "does not have storage.objects.get access" (seen on the first real deploy). Grant it the standard
+# Cloud Build builder role - the narrowest documented fix, build service account only.
+log "Build service account (default compute SA) -> roles/cloudbuild.builds.builder"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  PROJECT_NUMBER="<project number>"
+else
+  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format 'value(projectNumber)')"
+fi
+run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role roles/cloudbuild.builds.builder --condition=None --quiet
+
 # --set-env-vars REPLACES all env vars on the service, so a stray FACTORYPULSE_FORCE_MOCK can never survive a deploy.
 ENV_VARS="GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${REGION},GEMINI_MODEL=${GEMINI_MODEL}"
 ENV_VARS+=",FACTORYPULSE_GCS_BUCKET=${BUCKET},FACTORYPULSE_BQ_DATASET=${BQ_DATASET},FACTORYPULSE_BQ_LOCATION=${BQ_LOCATION}"

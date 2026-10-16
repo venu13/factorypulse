@@ -1,9 +1,7 @@
 # Cloud Run deployment checklist
 
-> **Status:** these steps could **not** be executed in the authoring environment (no permission to use Docker,
-> no deploy credentials were used). The scripts were syntax-checked (`bash -n`) and `scripts/smoke_test.sh`
-> was exercised against a local Streamlit server, but **`deploy.sh` has never been run against a real project.**
-> Treat the first run as the real test and work through this list in order.
+> **Status:** `deploy.sh` and `scripts/smoke_test.sh` were run for real against project `project-6856615b-d7ea-4a2b-85d`
+> (us-central1) on 2026-10-16: deploy succeeded after the build-SA fix below; smoke test and an in-cloud preflight job passed.
 
 ## 0. Prerequisites
 - A GCP project with **billing enabled** and you as Owner/Editor (or Cloud Run Admin + Service Account Admin + Project IAM Admin).
@@ -82,3 +80,4 @@ The in-cloud preflight proves the **Cloud Run service account** can call Vertex 
 | Badge says `fallback (HTTP 429 ...)` | Quota; request an increase or retry; the app already retries twice with backoff |
 | BigQuery/GCS warning banner | Check SA roles and that `FACTORYPULSE_BQ_DATASET` exists in the same location (`FACTORYPULSE_BQ_LOCATION`) |
 | `deploy.sh` fails on `--allow-unauthenticated` | Org policy blocks public access |
+| First build: `Error 403 ... does not have storage.objects.get access` | The default compute service account has no roles in a new project. `deploy.sh` now grants it `roles/cloudbuild.builds.builder` (build SA only) before deploying |

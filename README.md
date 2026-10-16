@@ -4,7 +4,7 @@
 
 FactoryPulse turns three weak, separate signals — drifting machine telemetry, a photo of a suspect component, and a binder of SOPs — into one actionable, schema-validated **maintenance work order**. Gemini on Vertex AI reads the image (finding and boxing hairline cracks, pitting, heat tint), reasons over the anomaly report and the relevant SOPs, and returns a criticality rating, remaining-useful-life estimate, part numbers and a lock-out/tag-out repair procedure. Every AI result is labelled with where it came from (live Gemini, fallback, or offline mock), and deterministic safety floors stop the model from under-rating a critical fault.
 
-> **Live demo URL:** `<fill in after running ./deploy.sh>` · **Demo video:** `<fill in>`
+> **Live demo URL:** https://factorypulse-gnbcujjj5q-uc.a.run.app · **Demo video:** `<fill in>`
 > All plant data, SOPs and part numbers are **synthetic / illustrative**; see [Honest limitations](#honest-limitations).
 
 ## Problem → solution
