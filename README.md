@@ -20,7 +20,7 @@ FactoryPulse turns three weak, separate signals — drifting machine telemetry, 
 ## Features
 - **System Overview** – fleet health, active alerts, one-click **Demo Scenario**, *Fleet analytics* (BigQuery or in-memory), and an assumption-driven **impact estimate**.
 - **Telemetry Anomaly Explorer** – inject faults (inner-race bearing, thermal overload, cavitation) with adjustable severity, live-replay stream, Plotly charts with limit lines and anomaly markers, and a **Real Data Validation** panel (CWRU).
-- **Visual QA Lab** – synthetic samples, a real-image **sample gallery** (`sample_images/`), or your own uploads; annotated boxes, severity table, provenance.
+- **Visual QA Lab** – synthetic samples, a real-image **sample gallery** (`sample_images/`), or your own uploads; annotated boxes (approximate - see [accuracy](#vision-localization-accuracy-measured)), severity table, provenance.
 - **Field Engineer Copilot** – structured `WorkOrder` generation, root-cause chat with tool-calling, **PDF / JSON export**, optional save to Cloud Storage.
 - **Resilience** – timeouts, 2 retries with exponential backoff on 429/5xx, validation-retry, visible fallback.
 
@@ -132,11 +132,26 @@ See [.env.example](.env.example).
 
 Read this honestly: inner-race faults at 0.007–0.021″ on this rig are large changes in RMS, so detection is easy; the real finding is that a **fixed healthy baseline is load-sensitive** (normal data at another load looks anomalous). Production use would need load-conditioned baselines. Windows are autocorrelated, so these are not independent samples. The panel in the Telemetry tab shows the same numbers plus method and limitations.
 
+## Vision localization accuracy (measured)
+
+Measured live on `gemini-2.5-flash` (Vertex AI) against the known defect boxes of the three *synthetic* samples (weld, gear, bearing; 6 ground-truth defects), vision call with thinking off:
+
+| Result | Value |
+|---|---|
+| Defects found with the correct type | 13 / 18 (3 images × 3 repeats) |
+| Mean box IoU, found defects | **0.45** (0.25 with the model's default thinking) |
+| Mean box IoU, counting misses as 0 | **0.32** |
+| Large features (weld crack, heat tints) | IoU ≈ 0.5–0.6 |
+| Small / subtle features (gear wear patch, pitting clusters) | IoU ≈ 0.0–0.4; one wear patch was boxed in empty background |
+| Latency (thinking off vs default) | ≈ 5.7 s vs ≈ 11.2 s |
+
+So **boxes are approximate**: strong on large features, weak on small or subtle ones, and defect *types* are sometimes wrong (a bearing spall was labelled `other`). The `confidence` field is the **model's own self-reported number, not a calibrated probability**. Small sample, synthetic images, one model: treat as indicative, not as a benchmark. The pixel conversion itself is unit-tested; the error is in the model's localization.
+
 ## Honest limitations
 - **Telemetry, SOPs, part numbers, plant assets and cost figures are synthetic.** The impact panel is driven by editable *assumptions*, not measurements.
 - The CWRU check covers **one sensor, one rig, one fault type** (inner race), uses acceleration RMS rescaled to nominal (not calibrated velocity), and cannot validate thermal-overload or cavitation detection.
 - The detector's failure-mode classifier is rule-based and was developed on the simulator; it is not validated on real thermal/cavitation data.
-- Gemini bounding boxes and severities are model outputs without a labelled benchmark here; real defect images (NEU / MVTec AD) are supported through `sample_images/` but no accuracy figures are claimed. Offline mock results on real photos are placeholders.
+- Gemini box localization is approximate (mean IoU 0.45 on found defects, weak on small features), confidences are uncalibrated, and severities are unvalidated model outputs. Real defect images (NEU / MVTec AD) are supported through `sample_images/` but no accuracy figures on them are claimed. Offline mock results use embedded ground truth or placeholders and say so.
 - Streamlit session state is per browser tab; the in-memory analytics fallback is not persisted.
 - Streaming ingestion (Pub/Sub → Dataflow) is a documented design, not implemented.
 - Not a certified safety system; do not use for real maintenance decisions.
@@ -147,7 +162,7 @@ Read this honestly: inner-race faults at 0.007–0.021″ on this rig are large 
 |---|---|---|
 | 0:00 | Open the URL; point at the sidebar **VERTEX AI** badge | "Live Gemini on Vertex AI, running on Cloud Run." |
 | 0:15 | **Overview**: fleet cards, alerts | "Six assets; a cavitating pump, a bearing and a thermal-overload motor are already flagged." |
-| 0:35 | Click **▶ Run demo scenario** | "One click: inject an inner-race fault on PUMP-101…" |
+| 0:35 | Click **▶ Run demo scenario** | "One click: inject an inner-race fault on PUMP-101, then Gemini inspects a weld…" |
 | 0:50 | Watch the five progress steps | "…the detector flags it, Gemini inspects the bearing image, and a work order is generated." |
 | 1:15 | **Telemetry Explorer** → PUMP-101, toggle *Live stream replay* | "Vibration spikes, temperature rising; red X markers are anomaly flags; the detector attributes it to an inner-race defect." |
 | 1:45 | **Visual QA Lab** → inspect the *weld* sample | "Gemini finds and boxes a branching fatigue crack — CRITICAL — with a provenance badge." |
