@@ -8,18 +8,21 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fpdf import FPDF
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from inspector import (
-    DEFAULT_MODEL,
-    SEVERITY_RANK,
-    InspectionReport,
+from inspector import SEVERITY_RANK, InspectionReport
+from llm import (
+    LLMCallError,
+    Provenance,
+    generate_with_retry,
     get_genai_client,
-    get_llm_mode,
+    get_model,
+    llm_status,
 )
 
 logger = logging.getLogger("factorypulse.copilot")
@@ -265,24 +268,40 @@ def _incident_id(machine_id: str, anomaly: Dict[str, Any]) -> str:
     return f"INC-{machine_id}-{stamp_s}"
 
 
-def _apply_guardrails(wo: WorkOrder, machine_id: str, anomaly: Dict[str, Any], inspection: Optional[InspectionReport]) -> WorkOrder:
-    """Deterministic safety floors so a model error can never under-rate an incident."""
-    floor = 0
+def _apply_guardrails(
+    wo: WorkOrder, machine_id: str, anomaly: Dict[str, Any], inspection: Optional[InspectionReport]
+) -> Tuple[WorkOrder, List[str]]:
+    """Deterministic safety floors so a model error can never under-rate an incident.
+
+    Returns the (possibly corrected) work order and a list of human-readable notes describing
+    every override, so the UI can show when a floor overrode the model.
+    """
+    notes: List[str] = []
     status = anomaly.get("status", "HEALTHY")
-    floor = max(floor, {"CRITICAL": 2, "WARNING": 1}.get(status, 0))
+    floor, reason = 0, ""
+    status_floor = {"CRITICAL": 2, "WARNING": 1}.get(status, 0)
+    if status_floor > floor:
+        floor, reason = status_floor, f"telemetry status is {status}"
     if inspection:
         for d in inspection.defects:
-            floor = max(floor, SEVERITY_RANK[d.severity] - 1)
+            f = SEVERITY_RANK[d.severity] - 1
+            if f > floor:
+                floor, reason = f, f"a {d.severity} {d.defect_type.value.replace('_', ' ')} was found in visual inspection"
     data = wo.model_dump()
     if CRITICALITY_LEVELS.index(data["criticality"]) < floor:
+        notes.append(
+            f"Safety floor: criticality raised from {data['criticality']} to {CRITICALITY_LEVELS[floor]} because {reason}."
+        )
         data["criticality"] = CRITICALITY_LEVELS[floor]
     if not data["incident_id"].strip():
         data["incident_id"] = _incident_id(machine_id, anomaly)
     data["machine_id"] = machine_id
-    data["estimated_remaining_useful_life_hours"] = max(0.0, round(float(data["estimated_remaining_useful_life_hours"]), 1))
-    if CRITICALITY_LEVELS.index(data["criticality"]) >= 2:
+    rul = max(0.0, round(float(data["estimated_remaining_useful_life_hours"]), 1))
+    data["estimated_remaining_useful_life_hours"] = rul
+    if CRITICALITY_LEVELS.index(data["criticality"]) >= 2 and not data["loto_procedure_required"]:
         data["loto_procedure_required"] = True
-    return WorkOrder(**data)
+        notes.append("Safety floor: lock-out/tag-out forced to REQUIRED because criticality is HIGH or CRITICAL.")
+    return WorkOrder(**data), notes
 
 
 def generate_work_order(
@@ -290,24 +309,38 @@ def generate_work_order(
     anomaly: Dict[str, Any],
     inspection: Optional[InspectionReport] = None,
     use_mock: Optional[bool] = None,
-    model: str = DEFAULT_MODEL,
-) -> Tuple[WorkOrder, str]:
-    """Produce a WorkOrder. Returns (work_order, source) with source 'gemini' or 'mock'."""
-    mode = "mock" if use_mock else get_llm_mode()
-    wo: Optional[WorkOrder] = None
-    source = "mock"
-    if mode != "mock":
+    model: Optional[str] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[WorkOrder, Provenance]:
+    """Produce a WorkOrder. Returns (work_order, provenance); provenance.notes lists safety-floor overrides."""
+    model = model or get_model()
+    status = llm_status()
+    started = time.time()
+    if use_mock or status["mode"] == "mock":
+        reason = "offline mode selected" if use_mock and status["mode"] != "mock" else status["reason"]
+        wo, prov = _triage_mock(machine_id, anomaly, inspection), Provenance.mock(reason)
+    else:
         try:
-            wo = _triage_gemini(machine_id, anomaly, inspection, mode, model)
-            source = "gemini"
-        except Exception as exc:  # noqa: BLE001
+            wo, attempts = _triage_gemini(machine_id, anomaly, inspection, status["mode"], model, sleep)
+            prov = Provenance.live(model, started, attempts)
+        except LLMCallError as exc:
             logger.warning("Gemini triage failed (%s); using rule-based engine.", exc)
-    if wo is None:
-        wo = _triage_mock(machine_id, anomaly, inspection)
-    return _apply_guardrails(wo, machine_id, anomaly, inspection), source
+            wo, prov = _triage_mock(machine_id, anomaly, inspection), Provenance.fallback(exc, model, started)
+    wo, notes = _apply_guardrails(wo, machine_id, anomaly, inspection)
+    prov.notes = notes
+    return wo, prov
 
 
-def _triage_gemini(machine_id: str, anomaly: Dict[str, Any], inspection: Optional[InspectionReport], mode: str, model: str) -> WorkOrder:
+def _triage_gemini(
+    machine_id: str,
+    anomaly: Dict[str, Any],
+    inspection: Optional[InspectionReport],
+    mode: str,
+    model: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[WorkOrder, int]:
+    """Structured-output triage. Validates against WorkOrder; on failure retries once with the
+    validation error appended to the prompt, then raises LLMCallError."""
     from google.genai import types
 
     client = get_genai_client(mode)
@@ -321,19 +354,26 @@ def _triage_gemini(machine_id: str, anomaly: Dict[str, Any], inspection: Optiona
         f"## Retrieved SOPs and parts (JSON)\n{json.dumps(sops, indent=2)}\n\n"
         "Produce the work order."
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=TRIAGE_SYSTEM,
-            temperature=0.2,
-            response_mime_type="application/json",
-            response_schema=WorkOrder,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=TRIAGE_SYSTEM,
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=WorkOrder,
     )
-    if getattr(response, "parsed", None) is not None and isinstance(response.parsed, WorkOrder):
-        return response.parsed
-    return WorkOrder.model_validate_json(response.text)
+    attempts_total, err = 0, ""
+    for validation_round in range(2):
+        round_prompt = prompt if validation_round == 0 else (
+            prompt + "\n\nYour previous response failed validation against the WorkOrder schema with this error:\n"
+            f"{err}\nReturn corrected JSON that satisfies the schema exactly."
+        )
+        response, attempts = generate_with_retry(client, model=model, contents=round_prompt, config=config, sleep=sleep)
+        attempts_total += attempts
+        try:
+            return WorkOrder.model_validate_json(response.text or ""), attempts_total
+        except (ValidationError, ValueError) as exc:
+            err = str(exc)[:1500]
+            logger.warning("WorkOrder validation failed (round %d): %s", validation_round + 1, err)
+    raise LLMCallError("response failed WorkOrder validation after retry", err, attempts_total)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -458,23 +498,45 @@ def chat_reply(
     user_message: str,
     context: Dict[str, Any],
     use_mock: Optional[bool] = None,
-    model: str = DEFAULT_MODEL,
-) -> Tuple[str, str]:
-    """Answer a question about the selected machine. Returns (text, source).
+    model: Optional[str] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[str, Provenance]:
+    """Answer a question about the selected machine. Returns (text, provenance).
 
     ``history`` is a list of {"role": "user"|"assistant", "content": str} prior turns.
     ``context`` holds machine_id, anomaly (dict), inspection (dict|None), work_order (dict|None).
     """
-    mode = "mock" if use_mock else get_llm_mode()
-    if mode != "mock":
-        try:
-            return _chat_gemini(history, user_message, context, mode, model), "gemini"
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Gemini chat failed (%s); using offline copilot.", exc)
-    return _chat_mock(user_message, context), "mock"
+    model = model or get_model()
+    status = llm_status()
+    if use_mock or status["mode"] == "mock":
+        reason = "offline mode selected" if use_mock and status["mode"] != "mock" else status["reason"]
+        return _chat_mock(user_message, context), Provenance.mock(reason)
+    started = time.time()
+    try:
+        text, attempts, tool_calls = _chat_gemini(history, user_message, context, status["mode"], model, sleep)
+        return text, Provenance.live(model, started, attempts, tool_calls)
+    except LLMCallError as exc:
+        logger.warning("Gemini chat failed (%s); using offline copilot.", exc)
+        return _chat_mock(user_message, context), Provenance.fallback(exc, model, started)
 
 
-def _chat_gemini(history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], mode: str, model: str) -> str:
+def _count_tool_calls(response: Any) -> int:
+    n = 0
+    for content in getattr(response, "automatic_function_calling_history", None) or []:
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "function_call", None) is not None:
+                n += 1
+    return n
+
+
+def _chat_gemini(
+    history: List[Dict[str, str]],
+    user_message: str,
+    context: Dict[str, Any],
+    mode: str,
+    model: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[str, int, int]:
     from google.genai import types
 
     client = get_genai_client(mode)
@@ -488,7 +550,8 @@ def _chat_gemini(history: List[Dict[str, str]], user_message: str, context: Dict
         for m in history
     ]
     contents.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
-    response = client.models.generate_content(
+    response, attempts = generate_with_retry(
+        client,
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -496,10 +559,11 @@ def _chat_gemini(history: List[Dict[str, str]], user_message: str, context: Dict
             temperature=0.3,
             tools=[lookup_sop, lookup_spare_part, get_machine_status],  # automatic function calling
         ),
+        sleep=sleep,
     )
     if not response.text:
-        raise RuntimeError("Empty response from Gemini")
-    return response.text
+        raise LLMCallError("empty response", "Gemini returned no text", attempts)
+    return response.text, attempts, _count_tool_calls(response)
 
 
 def _chat_mock(message: str, context: Dict[str, Any]) -> str:
@@ -541,6 +605,7 @@ def _chat_mock(message: str, context: Dict[str, Any]) -> str:
 # Export
 # --------------------------------------------------------------------------- #
 def work_order_to_json(wo: WorkOrder, meta: Optional[Dict[str, Any]] = None) -> str:
+    """Serialize the work order plus provenance metadata (meta['provenance'] is always included)."""
     payload = {"work_order": wo.model_dump(), "meta": meta or {}}
     return json.dumps(payload, indent=2, default=str)
 
@@ -575,7 +640,7 @@ def work_order_to_pdf(wo: WorkOrder, meta: Optional[Dict[str, Any]] = None) -> b
     pdf.set_text_color(200, 205, 215)
     pdf.set_font("Helvetica", "", 9)
     generated = meta.get("generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M")
-    pdf.cell(0, 6, _safe(f"Generated {generated}  -  Source: {meta.get('source', 'n/a')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _safe(f"Generated {generated}  -  Provenance: {meta.get('provenance', 'n/a')}"), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_y(38)
     pdf.set_text_color(20, 20, 20)
@@ -633,6 +698,13 @@ def work_order_to_pdf(wo: WorkOrder, meta: Optional[Dict[str, Any]] = None) -> b
         pdf.set_x(12)
         pdf.multi_cell(0, 6, _safe(f"{i}. {step}"), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(1)
+
+    for note in meta.get("safety_notes", []):
+        pdf.set_x(12)
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.set_text_color(160, 60, 20)
+        pdf.multi_cell(0, 5, _safe(note), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(20, 20, 20)
 
     heading("Sign-off")
     pdf.set_font("Helvetica", "", 10)

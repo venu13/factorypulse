@@ -11,50 +11,28 @@ import io
 import json
 import logging
 import math
-import os
+import time
 from enum import Enum
-from typing import List, Literal, Optional, Tuple
+from typing import Any, Callable, List, Literal, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from PIL.PngImagePlugin import PngInfo
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from llm import (  # noqa: F401  (re-exported for backwards compatibility)
+    LLMCallError,
+    Provenance,
+    generate_with_retry,
+    get_genai_client,
+    get_llm_mode,
+    get_model,
+    llm_status,
+)
 
 logger = logging.getLogger("factorypulse.inspector")
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-
-# --------------------------------------------------------------------------- #
-# LLM client helpers (shared with copilot.py)
-# --------------------------------------------------------------------------- #
-def get_llm_mode() -> str:
-    """Return 'gemini-api', 'vertex' or 'mock' based on the environment."""
-    if os.getenv("FACTORYPULSE_FORCE_MOCK", "").lower() in {"1", "true", "yes"}:
-        return "mock"
-    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
-        return "gemini-api"
-    if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {"1", "true", "yes"} and os.getenv(
-        "GOOGLE_CLOUD_PROJECT"
-    ):
-        return "vertex"
-    return "mock"
-
-
-def get_genai_client(mode: Optional[str] = None):
-    """Build a google-genai client for the resolved mode, or None in mock mode."""
-    mode = mode or get_llm_mode()
-    if mode == "mock":
-        return None
-    from google import genai  # imported lazily so mock mode needs no credentials
-
-    if mode == "gemini-api":
-        return genai.Client(api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
-    return genai.Client(
-        vertexai=True,
-        project=os.environ["GOOGLE_CLOUD_PROJECT"],
-        location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
-    )
+DEFAULT_MODEL = get_model()
 
 
 # --------------------------------------------------------------------------- #
@@ -73,24 +51,63 @@ class DefectType(str, Enum):
 Severity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 
+def normalize_box(raw: Any) -> Optional[List[int]]:
+    """Coerce a model-supplied box to [ymin, xmin, ymax, xmax] ints in 0-1000, ordered and clamped.
+
+    Returns None when the value is not a usable box (wrong length, non-numeric, NaN/inf,
+    or zero area after clamping).
+    """
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        vals = [float(c) for c in raw]
+    except (TypeError, ValueError):
+        return None
+    if any(math.isnan(c) or math.isinf(c) for c in vals):
+        return None
+    vals = [int(round(min(max(c, 0.0), 1000.0))) for c in vals]
+    ymin, xmin, ymax, xmax = vals
+    ymin, ymax = sorted((ymin, ymax))
+    xmin, xmax = sorted((xmin, xmax))
+    if ymax == ymin or xmax == xmin:
+        return None
+    return [ymin, xmin, ymax, xmax]
+
+
+def box_to_pixels(box: Optional[List[int]], width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
+    """Convert a normalized [ymin, xmin, ymax, xmax] (0-1000) box to pixel (x0, y0, x1, y1).
+
+    The result is clamped to the image bounds; None for a missing/invalid box.
+    """
+    nb = normalize_box(box)
+    if nb is None or width <= 0 or height <= 0:
+        return None
+    ymin, xmin, ymax, xmax = nb
+    x0 = min(max(int(round(xmin / 1000 * width)), 0), width - 1)
+    x1 = min(max(int(round(xmax / 1000 * width)), 0), width - 1)
+    y0 = min(max(int(round(ymin / 1000 * height)), 0), height - 1)
+    y1 = min(max(int(round(ymax / 1000 * height)), 0), height - 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
 class Defect(BaseModel):
     defect_type: DefectType
     severity: Severity
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence between 0 and 1")
-    box_2d: List[int] = Field(
-        description="Bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000",
-        min_length=4,
-        max_length=4,
+    box_2d: Optional[List[int]] = Field(
+        default=None,
+        description="Bounding box [ymin, xmin, ymax, xmax] as integers normalized to 0-1000 (origin top-left)",
     )
     description: str = Field(description="What is visible and why it is classified this way")
     recommended_action: str
 
-    @field_validator("box_2d")
+    @field_validator("box_2d", mode="before")
     @classmethod
-    def _normalize_box(cls, v: List[int]) -> List[int]:
-        v = [int(min(max(c, 0), 1000)) for c in v]
-        ymin, xmin, ymax, xmax = v
-        return [min(ymin, ymax), min(xmin, xmax), max(ymin, ymax), max(xmin, xmax)]
+    def _coerce_box(cls, v: Any) -> Optional[List[int]]:
+        """Never let a malformed box fail the whole report: unusable boxes become None."""
+        return normalize_box(v)
 
 
 class InspectionReport(BaseModel):
@@ -150,27 +167,35 @@ def inspect_image(
     image_bytes: bytes,
     component_hint: str = "",
     use_mock: Optional[bool] = None,
-    model: str = DEFAULT_MODEL,
-) -> Tuple[InspectionReport, str]:
-    """Analyze an image. Returns (report, source) where source is 'gemini' or 'mock'.
+    model: Optional[str] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[InspectionReport, Provenance]:
+    """Analyze an image. Returns (report, provenance).
 
-    Falls back to the offline mock if the live call fails so the demo never breaks.
+    Provenance is 'gemini-live', 'fallback' (live call failed; error text retained) or 'mock'.
     """
-    mode = "mock" if use_mock else get_llm_mode()
-    if mode != "mock":
-        try:
-            return _inspect_gemini(image_bytes, component_hint, mode, model), "gemini"
-        except Exception as exc:  # noqa: BLE001 - surface to log, degrade gracefully
-            logger.warning("Gemini inspection failed (%s); using mock analysis.", exc)
-    return _inspect_mock(image_bytes, component_hint), "mock"
+    model = model or get_model()
+    status = llm_status()
+    if use_mock or status["mode"] == "mock":
+        reason = "offline mode selected" if use_mock and status["mode"] != "mock" else status["reason"]
+        return _inspect_mock(image_bytes, component_hint), Provenance.mock(reason)
+    started = time.time()
+    try:
+        report, attempts = _inspect_gemini(image_bytes, component_hint, status["mode"], model, sleep)
+        return report, Provenance.live(model, started, attempts)
+    except LLMCallError as exc:
+        logger.warning("Gemini inspection failed (%s); using mock analysis.", exc)
+        return _inspect_mock(image_bytes, component_hint), Provenance.fallback(exc, model, started)
 
 
-def _inspect_gemini(image_bytes: bytes, component_hint: str, mode: str, model: str) -> InspectionReport:
+def _inspect_gemini(image_bytes: bytes, component_hint: str, mode: str, model: str,
+                    sleep: Callable[[float], None]) -> Tuple[InspectionReport, int]:
     from google.genai import types
 
     client = get_genai_client(mode)
     context = f"\nOperator context: {component_hint}" if component_hint else ""
-    response = client.models.generate_content(
+    response, attempts = generate_with_retry(
+        client,
         model=model,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type=_mime_for(image_bytes)),
@@ -181,10 +206,12 @@ def _inspect_gemini(image_bytes: bytes, component_hint: str, mode: str, model: s
             response_mime_type="application/json",
             response_schema=InspectionReport,
         ),
+        sleep=sleep,
     )
-    if getattr(response, "parsed", None) is not None and isinstance(response.parsed, InspectionReport):
-        return response.parsed
-    return InspectionReport.model_validate_json(response.text)
+    try:
+        return InspectionReport.model_validate_json(response.text or ""), attempts
+    except (ValidationError, ValueError) as exc:
+        raise LLMCallError("response failed schema validation", str(exc)[:1500], attempts) from exc
 
 
 _ACTIONS = {
@@ -259,14 +286,19 @@ def _inspect_mock(image_bytes: bytes, component_hint: str) -> InspectionReport:
 # Annotation
 # --------------------------------------------------------------------------- #
 def annotate_image(image_bytes: bytes, report: InspectionReport) -> Image.Image:
-    """Draw numbered, severity-colored bounding boxes onto the image."""
+    """Draw numbered, severity-colored bounding boxes onto the image.
+
+    Defects whose box is missing or unusable are skipped (they still appear in the table).
+    """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img, "RGBA")
     w, h = img.size
     font = ImageFont.load_default(size=max(14, w // 55))
     for i, d in enumerate(report.defects, start=1):
-        ymin, xmin, ymax, xmax = d.box_2d
-        box = (xmin / 1000 * w, ymin / 1000 * h, xmax / 1000 * w, ymax / 1000 * h)
+        px = box_to_pixels(d.box_2d, w, h)
+        if px is None:
+            continue
+        box = px
         color = SEVERITY_COLOR[d.severity]
         draw.rectangle(box, outline=color + (255,), width=max(2, w // 300), fill=color + (30,))
         label = f"{i}. {d.defect_type.value.replace('_', ' ')} [{d.severity}] {d.confidence:.0%}"

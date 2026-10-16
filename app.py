@@ -19,16 +19,17 @@ from copilot import (
     work_order_to_json,
     work_order_to_pdf,
 )
+from diagnostics import describe_environment, run_preflight
 from inspector import (
-    DEFAULT_MODEL,
     SAMPLE_KINDS,
     SEVERITY_RANK,
     InspectionReport,
     annotate_image,
-    get_llm_mode,
+    box_to_pixels,
     inspect_image,
     make_sample_image,
 )
+from llm import Provenance, get_model, llm_status, on_cloud_run
 from telemetry import (
     CHANNEL_META,
     CHANNELS,
@@ -136,10 +137,30 @@ def fmt_mode(value: str) -> str:
     return FaultMode(value).label
 
 
+def prov_badge(prov: Dict[str, Any]) -> str:
+    """HTML pill showing where a result came from (live Gemini, fallback, or mock)."""
+    color = {"gemini-live": GREEN, "fallback": RED, "mock": AMBER}[prov["kind"]]
+    icon = {"gemini-live": "●", "fallback": "▲", "mock": "○"}[prov["kind"]]
+    extra = f' · {prov["latency_ms"]} ms' if prov.get("latency_ms") else ""
+    return pill(f'{icon} {prov["label"]}{extra}', color)
+
+
+def prov_details(prov: Dict[str, Any]) -> None:
+    """Show the real exception for fallbacks and any safety-floor overrides."""
+    if prov["kind"] == "fallback":
+        st.warning(f'Gemini call failed - showing the offline fallback result instead ({prov["reason"]}).')
+        with st.expander("Error details (exact exception)"):
+            st.code(prov["error"] or "(no message)", language="text")
+            st.caption(f'attempts: {prov["attempts"]} · model: {prov["model"]}')
+    elif prov["kind"] == "mock":
+        st.caption(f'Offline mock result - {prov["reason"]}.')
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
-llm_mode = get_llm_mode()
+status_info = llm_status()
+llm_mode = status_info["mode"]
 with st.sidebar:
     st.markdown('<div class="fp-brand">FACTORYPULSE</div>', unsafe_allow_html=True)
     st.markdown('<div class="fp-sub">Predictive maintenance &amp; visual inspection copilot</div>', unsafe_allow_html=True)
@@ -147,16 +168,27 @@ with st.sidebar:
         "Force offline demo mode",
         value=(llm_mode == "mock"),
         disabled=(llm_mode == "mock"),
-        help="Use the built-in rule-based engine instead of calling Gemini.",
+        help="Use the built-in rule-based engine instead of calling Gemini. Off by default.",
     )
     use_mock = force_mock or llm_mode == "mock"
     if use_mock:
         st.markdown(pill("OFFLINE MOCK", AMBER), unsafe_allow_html=True)
-        st.caption("Set `GEMINI_API_KEY` or Vertex AI env vars to enable live Gemini reasoning.")
+        st.caption(f"Reason: {status_info['reason']}. Set `GEMINI_API_KEY` or Vertex AI env vars for live Gemini.")
+        if on_cloud_run():
+            st.error("Running on Cloud Run without live Gemini - check the service account and GOOGLE_CLOUD_PROJECT.")
     else:
         label = "GEMINI API" if llm_mode == "gemini-api" else "VERTEX AI"
         st.markdown(pill(label, GREEN), unsafe_allow_html=True)
-        st.caption(f"Model: `{DEFAULT_MODEL}`")
+        loc = f" · {status_info.get('project')} / {status_info.get('location')}" if llm_mode == "vertex" else ""
+        st.caption(f"Model: `{get_model()}`{loc}")
+    with st.expander("🩺 Diagnostics"):
+        st.caption("Runs one real call each: vision, structured triage, tool-calling chat.")
+        if st.button("Run Gemini self-test", use_container_width=True):
+            with st.spinner("Calling Gemini..."):
+                st.session_state.preflight = run_preflight(expect_live=not use_mock, use_mock=use_mock)
+        if st.session_state.get("preflight"):
+            st.dataframe(pd.DataFrame(st.session_state.preflight)[["check", "result", "provenance", "latency_ms", "detail"]],
+                         hide_index=True, use_container_width=True)
     st.divider()
     st.caption("Simulated plant: 6 rotating assets, 5 s sampling. Inject faults in the **Telemetry Explorer** tab.")
     if st.button("🎲 Re-roll sensor noise", use_container_width=True):
@@ -392,12 +424,12 @@ with tab_qa:
         run = st.button("🔍 Run visual inspection", type="primary", use_container_width=True, disabled=image_bytes is None)
         if run and image_bytes:
             with st.spinner("Analyzing image with Gemini..." if not use_mock else "Analyzing image (offline mock)..."):
-                report_obj, src = inspect_image(image_bytes, hint, use_mock=use_mock)
+                report_obj, prov = inspect_image(image_bytes, hint, use_mock=use_mock)
             annotated = annotate_image(image_bytes, report_obj)
             buf = io.BytesIO()
             annotated.save(buf, format="PNG")
             st.session_state.inspections[qa_machine] = {
-                "report": report_obj.model_dump(mode="json"), "source": src,
+                "report": report_obj.model_dump(mode="json"), "prov": prov.to_dict(),
                 "original": image_bytes, "annotated": buf.getvalue(),
                 "at": datetime.now().strftime("%H:%M:%S"),
             }
@@ -416,7 +448,9 @@ with tab_qa:
             m1.markdown(f'<div class="fp-card" style="--c:{cond_color}"><div class="fp-muted">Condition</div>'
                         f'{pill(rep["overall_condition"], cond_color)}</div>', unsafe_allow_html=True)
             m2.metric("Quality score", f'{rep["quality_score"]}/100')
-            m3.metric("Defects found", len(rep["defects"]), delta=f'via {rec["source"]} @ {rec["at"]}', delta_color="off")
+            m3.metric("Defects found", len(rep["defects"]), delta=f'at {rec["at"]}', delta_color="off")
+            st.markdown("Provenance: " + prov_badge(rec["prov"]), unsafe_allow_html=True)
+            prov_details(rec["prov"])
             tab_a, tab_b = st.tabs(["Gemini annotated", "Original"])
             tab_a.image(rec["annotated"], use_container_width=True)
             tab_b.image(rec["original"], use_container_width=True)
@@ -426,7 +460,8 @@ with tab_qa:
                     [
                         {
                             "#": i, "Defect": d["defect_type"].replace("_", " "), "Severity": d["severity"],
-                            "Confidence": f'{d["confidence"]:.0%}', "Evidence": d["description"],
+                            "Confidence": f'{d["confidence"]:.0%}',
+                            "Box": "yes" if d.get("box_2d") else "not localized", "Evidence": d["description"],
                             "Action": d["recommended_action"],
                         }
                         for i, d in enumerate(rep["defects"], 1)
@@ -470,10 +505,11 @@ with tab_copilot:
         if st.button("⚡ Run AI triage & generate work order", type="primary", use_container_width=True):
             inspection_obj = InspectionReport.model_validate(insp_rec["report"]) if (insp_rec and include_insp) else None
             with st.spinner("Correlating telemetry, vision and SOPs..."):
-                wo, src = generate_work_order(cp_machine, anomaly, inspection_obj, use_mock=use_mock)
+                wo, prov = generate_work_order(cp_machine, anomaly, inspection_obj, use_mock=use_mock)
             st.session_state.work_orders[cp_machine] = {
-                "wo": wo, "source": src, "sig": sig_for(cp_machine),
-                "meta": {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "source": f"{src} ({DEFAULT_MODEL})" if src == "gemini" else "offline rule engine",
+                "wo": wo, "prov": prov.to_dict(), "sig": sig_for(cp_machine),
+                "meta": {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "provenance": prov.label,
+                         "provenance_detail": prov.to_dict(), "safety_notes": prov.notes,
                          "telemetry_status": anomaly["status"], "inspection_attached": inspection_obj is not None},
             }
 
@@ -483,6 +519,10 @@ with tab_copilot:
             if rec_wo["sig"] != sig_for(cp_machine):
                 st.warning("Telemetry or inspection changed since this work order was generated - regenerate to refresh.")
             cc = CRIT_COLOR[wo.criticality]
+            st.markdown("Provenance: " + prov_badge(rec_wo["prov"]), unsafe_allow_html=True)
+            prov_details(rec_wo["prov"])
+            for note in rec_wo["prov"]["notes"]:
+                st.info(f"🛡️ {note}")
             st.markdown(
                 f'<div class="fp-wo"><div class="fp-muted">{wo.incident_id}</div>'
                 f'<h3 style="margin:.1rem 0">{wo.failure_mode}</h3>'
@@ -502,7 +542,6 @@ with tab_copilot:
                                mime="application/pdf", use_container_width=True)
             e2.download_button("🧾 Export JSON", work_order_to_json(wo, rec_wo["meta"]), file_name=f"{wo.incident_id}.json",
                                mime="application/json", use_container_width=True)
-            st.caption(f'Generated by: {rec_wo["meta"]["source"]}')
 
     with p2:
         st.subheader("Root-cause chat")
@@ -514,6 +553,12 @@ with tab_copilot:
             for msg in history:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
+                    if msg.get("prov"):
+                        st.markdown(prov_badge(msg["prov"]) + (f' · {msg["prov"]["tool_calls"]} tool call(s)' if msg["prov"]["tool_calls"] else ""),
+                                    unsafe_allow_html=True)
+                        if msg["prov"]["kind"] == "fallback":
+                            with st.expander("Error details (exact exception)"):
+                                st.code(msg["prov"]["error"] or "(no message)", language="text")
 
         quick = st.columns(4)
         picked: Optional[str] = None
@@ -529,7 +574,7 @@ with tab_copilot:
                 "work_order": rec_wo["wo"].model_dump() if rec_wo else None,
             }
             with st.spinner("Thinking..."):
-                answer, src = chat_reply(history, prompt, ctx, use_mock=use_mock)
+                answer, prov = chat_reply([{"role": m["role"], "content": m["content"]} for m in history], prompt, ctx, use_mock=use_mock)
             history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": answer})
+            history.append({"role": "assistant", "content": answer, "prov": prov.to_dict()})
             st.rerun()
