@@ -119,18 +119,18 @@ See [.env.example](.env.example).
 
 ## Real-data validation (CWRU bearing dataset)
 
-`python scripts/validate_real_bearing_data.py` downloads 16 public recordings from the [Case Western Reserve University Bearing Data Center](https://engineering.case.edu/bearingdatacenter/download-data-file) (normal baseline + inner-race faults, 3 diameters × 4 motor loads) and runs the **untuned default detector** on 50 ms window-RMS features. Results from the run committed in `reports/validation_cwru.json`:
+`python scripts/validate_real_bearing_data.py` downloads 16 public recordings from the [Case Western Reserve University Bearing Data Center](https://engineering.case.edu/bearingdatacenter/download-data-file) (normal baseline + inner-race faults, 3 diameters × 4 motor loads) and runs the detector (default settings) on 50 ms window-RMS features. Results committed in `reports/validation_cwru.json`:
 
-| Metric (window level, 12 fault streams) | Value |
-|---|---|
-| Fault detected | **12 / 12** streams, first window |
-| Recall | **100 %** (2434 TP, 0 FN) |
-| Precision | **74.1 %** (849 FP) |
-| F1 | 85.1 % |
-| False alarms on held-out *normal*, same motor load as baseline | **0 / 1215** |
-| False alarms on held-out *normal*, different motor load | **849 / 6345 (13.4 %)** |
+| Metric (window level, 12 fault streams) | Before deadband fix | **Current** |
+|---|---|---|
+| Fault detected | 12 / 12 streams | **12 / 12** streams, first window |
+| Recall | 100 % (0 FN) | **99.96 %** (2433 TP, 1 FN) |
+| Precision | 74.1 % (849 FP) | **99.0 %** (24 FP) |
+| F1 | 85.1 % | **99.5 %** |
+| False alarms on held-out *normal*, same motor load as baseline | 0 / 1215 | **0 / 1215** |
+| False alarms on held-out *normal*, different motor load | 849 / 6345 (13.4 %) | **24 / 6345 (0.4 %)** |
 
-Read this honestly: inner-race faults at 0.007–0.021″ on this rig are large changes in RMS, so detection is easy; the real finding is that a **fixed healthy baseline is load-sensitive** (normal data at another load looks anomalous). Production use would need load-conditioned baselines. Windows are autocorrelated, so these are not independent samples. The panel in the Telemetry tab shows the same numbers plus method and limitations.
+**How this changed, and how to read it.** The first run exposed a load-sensitive baseline (13.4 % false alarms when the motor load differed). Separately, the live demo showed a *healthy simulated* asset in WARNING: 43 % of healthy simulated windows raised a finding (0 of 300 after the fix) because normal duty-cycle swings exceeded 3.5σ of a short baseline. Both were addressed with an **engineering deadband** (`MIN_DEVIATION` in `telemetry.py`): a z-score excursion only counts if the absolute change is also physically meaningful. The deadband values were chosen from simulator behaviour and **were not iterated on CWRU** - but CWRU was measured after the change, so treat the improvement as encouraging, not as an independent confirmation. On the rescaled CWRU feature the vibration deadband acts as a ~30 % change from baseline RMS, which these large seeded faults (0.007-0.021″) clear easily; subtler real faults may be missed. A fixed baseline can still be load-sensitive in principle (24 residual cross-load false alarms, all with the load-3 baseline). Windows are autocorrelated, so counts are not independent samples. The Telemetry-tab panel shows the same numbers, the earlier-version comparison, method and limitations.
 
 ## Vision localization accuracy (measured)
 
@@ -149,7 +149,7 @@ So **boxes are approximate**: strong on large features, weak on small or subtle 
 
 ## Honest limitations
 - **Telemetry, SOPs, part numbers, plant assets and cost figures are synthetic.** The impact panel is driven by editable *assumptions*, not measurements.
-- The CWRU check covers **one sensor, one rig, one fault type** (inner race), uses acceleration RMS rescaled to nominal (not calibrated velocity), and cannot validate thermal-overload or cavitation detection.
+- The CWRU check covers **one sensor, one rig, one fault type** (inner race), uses acceleration RMS rescaled to nominal (not calibrated velocity), and cannot validate thermal-overload or cavitation detection. The detector's deadband was tuned on simulated healthy data, and CWRU numbers were observed only after that change.
 - The detector's failure-mode classifier is rule-based and was developed on the simulator; it is not validated on real thermal/cavitation data.
 - Gemini box localization is approximate (mean IoU 0.45 on found defects, weak on small features), confidences are uncalibrated, and severities are unvalidated model outputs. Real defect images (NEU / MVTec AD) are supported through `sample_images/` but no accuracy figures on them are claimed. Offline mock results use embedded ground truth or placeholders and say so.
 - Streamlit session state is per browser tab; the in-memory analytics fallback is not persisted.

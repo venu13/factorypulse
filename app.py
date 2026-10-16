@@ -681,11 +681,20 @@ with tab_telemetry:
             v2.metric("Recall", pct(ag["recall"]))
             v3.metric("F1", pct(ag["f1"]))
             v4.metric("False-positive rate", pct(ag["false_positive_rate"]))
+            other_rate = ag["fp_other_load"] / max(ag["heldout_other_load"], 1)
             st.markdown(
                 f'Detector caught the fault in **{ag["streams_with_detection"]}/{ag["streams"]}** inner-race streams. '
                 f'False alarms on held-out *normal* windows: **{ag["fp_same_load"]}/{ag["heldout_same_load"]}** at the baseline\'s '
-                f'own motor load, but **{ag["fp_other_load"]}/{ag["heldout_other_load"]}** when the load differs - the fixed baseline '
-                "is load-sensitive.")
+                f'own motor load and **{ag["fp_other_load"]}/{ag["heldout_other_load"]}** ({other_rate:.1%}) when the load differs. '
+                + ("A fixed healthy baseline is still load-sensitive in principle." if other_rate > 0 else ""))
+            cmp_ = val.get("comparison_before_deadband")
+            if cmp_:
+                c = cmp_["aggregate"]
+                st.caption(
+                    f'Before the engineering-deadband fix (earlier detector version, same data): precision {pct(c["precision"])}, '
+                    f'recall {pct(c["recall"])}, false-positive rate {pct(c["false_positive_rate"])}, cross-load false alarms '
+                    f'{c["fp_other_load"]}/{c["heldout_other_load"]}. The deadband was chosen to stop false alarms on simulated healthy '
+                    "data and was not iterated on CWRU; CWRU was measured after the change. One sensor, one rig, inner race only.")
             sdf = pd.DataFrame(val["streams"])[["fault", "load_hp", "precision", "recall", "false_positive_rate",
                                                 "fp_same_load", "fp_other_load", "detection_delay_ms"]]
             st.dataframe(sdf, hide_index=True, use_container_width=True)

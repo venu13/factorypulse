@@ -58,6 +58,19 @@ SENSOR_NOISE_FLOOR: Dict[str, float] = {
 }
 
 
+# Engineering deadband: a z-score excursion only counts if the absolute change is also physically meaningful.
+# Without it, a normal duty-cycle swing that the (short) baseline window did not cover - e.g. +/-1.5 degC bearing
+# temperature over a 20 min load cycle - exceeds 3.5 sigma of a tight baseline and raises false "drift" alarms
+# (measured: ~43 % of healthy windows before the deadband).
+MIN_DEVIATION: Dict[str, float] = {
+    "vibration_rms": 0.6,  # mm/s
+    "bearing_temp_c": 5.0,  # degC
+    "motor_current_a": 3.0,  # A
+    "rpm": 25.0,  # RPM
+    "acoustic_db": 3.0,  # dB
+}
+
+
 class FaultMode(str, Enum):
     NORMAL = "normal"
     BEARING_INNER_RACE = "bearing_inner_race"
@@ -265,10 +278,12 @@ class AnomalyDetector:
             vol = df[ch].rolling(self.vol_window, min_periods=self.vol_window).std() / sd
             out[f"{ch}_vol"] = vol.fillna(0.0).values
 
-            z_flag = (z.abs() > self.z_threshold).astype(int)
+            z_flag = ((z.abs() > self.z_threshold) & ((df[ch] - mu).abs() > MIN_DEVIATION[ch])).astype(int)
             z_persist = z_flag.rolling(self.persist_window, min_periods=1).sum() >= self.persist_k
             v_flag = (vol.fillna(0.0) > self.vol_ratio_threshold).astype(int)
             v_persist = v_flag.rolling(self.persist_window, min_periods=1).sum() >= self.persist_k
+            out[f"{ch}_zflag"] = z_persist.values
+            out[f"{ch}_vflag"] = v_persist.values
             flag = (level > 0) | z_persist | v_persist
             out[f"{ch}_flag"] = flag.values
             flag_cols.append(f"{ch}_flag")
@@ -324,9 +339,12 @@ class AnomalyDetector:
                     else f"{label} deviates {abs(snapshot[ch]['delta_pct']):.2f}% from baseline "
                     f"({rdf.mean():.0f} vs {mu:.0f} {unit}), breaching the {limit_name} band."
                 )
-            elif abs(z_recent) > self.z_threshold:
+            elif det[f"{ch}_zflag"].values[recent].any():
                 kind = "drift"
-                msg = f"{label} drifting {z_recent:+.1f}σ from healthy baseline ({mu:.2f} {unit})."
+                z_peak = float(z_recent) if abs(z_recent) > self.z_threshold else float(
+                    det[f"{ch}_z"].iloc[recent].iloc[int(det[f"{ch}_z"].iloc[recent].abs().values.argmax())])
+                msg = (f"{label} drifting {z_peak:+.1f}σ ({rdf.mean() - mu:+.2f} {unit}) "
+                       f"from healthy baseline ({mu:.2f} {unit}).")
             else:
                 kind = "volatility"
                 msg = (

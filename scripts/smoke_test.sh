@@ -25,13 +25,17 @@ CODE="$(curl -s -o /tmp/fp_index.html -w '%{http_code}' --max-time 20 "${URL}/")
 if [[ "${CODE}" == "200" ]] && grep -qi "streamlit" /tmp/fp_index.html; then pass "GET / -> 200 (Streamlit shell)"; else fail "GET / -> ${CODE}"; fi
 
 # 3. Websocket upgrade (what Streamlit needs behind the Cloud Run proxy)
+# Collect every HTTP status line in the response: a corporate proxy may prepend "200 Connection established",
+# so the server's own "101 Switching Protocols" must be searched for rather than taken from line 1.
 WS="$(curl -s --http1.1 -i --max-time 6 -o - "${URL}/_stcore/stream" \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
-  -H 'Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==' -H "Origin: ${URL}" 2>/dev/null | head -1)"
-if [[ "${WS}" == *"101"* ]]; then pass "websocket upgrade -> 101"; else fail "websocket upgrade -> '${WS:-no response}'"; fi
+  -H 'Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==' -H "Origin: ${URL}" 2>/dev/null | grep -a -E '^HTTP/[0-9.]+ [0-9]+' | tr -d '\r' | paste -sd'|' - || true)"
+if [[ "${WS}" == *" 101"* ]]; then pass "websocket upgrade -> 101"; else fail "websocket upgrade -> '${WS:-no response}'"; fi
 
 # 4. Live-Gemini preflight inside Cloud Run (if the job exists and gcloud is authenticated)
-if command -v gcloud >/dev/null 2>&1 && gcloud run jobs describe "${SERVICE}-preflight" --region "${REGION}" >/dev/null 2>&1; then
+if [[ "${SKIP_PREFLIGHT_JOB:-0}" == "1" ]]; then
+  echo "SKIP  in-cloud preflight (SKIP_PREFLIGHT_JOB=1)"
+elif command -v gcloud >/dev/null 2>&1 && gcloud run jobs describe "${SERVICE}-preflight" --region "${REGION}" >/dev/null 2>&1; then
   echo "Running in-cloud preflight job (this makes real Vertex AI calls)..."
   if gcloud run jobs execute "${SERVICE}-preflight" --region "${REGION}" --wait; then
     pass "in-cloud preflight job succeeded (see job logs for the PASS/FAIL table)"

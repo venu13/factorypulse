@@ -211,7 +211,7 @@ def main() -> int:
         "method": {
             "window_s": WINDOW_S, "baseline_windows": N_BASELINE, "feature": "window RMS of drive-end accelerometer (g)",
             "scaling": "baseline median rescaled to 2.0 mm/s nominal (accelerometer data are NOT velocity)",
-            "detector": "AnomalyDetector defaults (not tuned on this data); other channels held at nominal",
+            "detector": "AnomalyDetector defaults incl. MIN_DEVIATION engineering deadband (chosen from simulator false alarms, not iterated on CWRU); other channels held at nominal",
         },
         "aggregate": agg, "streams": rows, "notes": notes,
         "limitations": [
@@ -222,6 +222,13 @@ def main() -> int:
         ],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.out.exists():  # keep a recorded before/after comparison across re-runs
+        try:
+            prev = json.loads(args.out.read_text()).get("comparison_before_deadband")
+            if prev:
+                result["comparison_before_deadband"] = prev
+        except (ValueError, OSError):
+            pass
     args.out.write_text(json.dumps(result, indent=2))
 
     print(f"\n{'fault':8s} {'load':>4s} {'prec':>6s} {'recall':>7s} {'FPR':>6s} {'delay ms':>9s}")
