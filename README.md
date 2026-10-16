@@ -1,92 +1,175 @@
 # 🏭 FactoryPulse
-**Industrial Predictive Maintenance & Visual Inspection Copilot** — Google Cloud hackathon, *Manufacturing: Intelligent Operations & Industrial* track.
 
-FactoryPulse fuses three signals into one maintenance decision:
+**Industrial Predictive Maintenance & Visual Inspection Copilot** — AI Builder Cup 2026, *Manufacturing: Intelligent Operations & Industrial Efficiency*.
 
-1. **Telemetry anomaly detection** – synthetic pump/motor data (vibration RMS, bearing temp, motor current, RPM, acoustic dB) with four injectable fault modes, scored by ISO‑10816‑style limits, baseline z‑scores and volatility ratios.
-2. **Multimodal visual QA** – Gemini detects, localizes (bounding boxes) and classifies cracks, heat discoloration, pitting, wear, corrosion and weld porosity.
-3. **Operational copilot** – Gemini correlates both with SOPs and returns a Pydantic‑validated `WorkOrder` (criticality, RUL, parts, LOTO steps), plus a tool‑calling root‑cause chat. Export to PDF/JSON.
+FactoryPulse turns three weak, separate signals — drifting machine telemetry, a photo of a suspect component, and a binder of SOPs — into one actionable, schema-validated **maintenance work order**. Gemini on Vertex AI reads the image (finding and boxing hairline cracks, pitting, heat tint), reasons over the anomaly report and the relevant SOPs, and returns a criticality rating, remaining-useful-life estimate, part numbers and a lock-out/tag-out repair procedure. Every AI result is labelled with where it came from (live Gemini, fallback, or offline mock), and deterministic safety floors stop the model from under-rating a critical fault.
 
+> **Live demo URL:** `<fill in after running ./deploy.sh>` · **Demo video:** `<fill in>`
+> All plant data, SOPs and part numbers are **synthetic / illustrative**; see [Honest limitations](#honest-limitations).
+
+## Problem → solution
+
+| Track pain point | What FactoryPulse does |
+|---|---|
+| Unplanned downtime from rotating-equipment faults | Streaming-style anomaly detection (limits + z-score + volatility) with failure-mode attribution and hours-to-limit projection |
+| Quality escapes / missed cracks | Gemini multimodal inspection with localized defect boxes and severity grading |
+| Tribal knowledge, slow triage | Copilot correlates telemetry + vision + SOPs into a work order and answers questions with tool-calling lookups of SOPs and spare parts |
+| Safety | LOTO steps first in every procedure; safety floors raise under-rated criticality and force LOTO for HIGH/CRITICAL; overrides are shown |
+| Trust in AI output | Provenance badge on every result, exact error text on fallbacks, Pydantic-validated outputs, retries with validation feedback |
+
+## Features
+- **System Overview** – fleet health, active alerts, one-click **Demo Scenario**, *Fleet analytics* (BigQuery or in-memory), and an assumption-driven **impact estimate**.
+- **Telemetry Anomaly Explorer** – inject faults (inner-race bearing, thermal overload, cavitation) with adjustable severity, live-replay stream, Plotly charts with limit lines and anomaly markers, and a **Real Data Validation** panel (CWRU).
+- **Visual QA Lab** – synthetic samples, a real-image **sample gallery** (`sample_images/`), or your own uploads; annotated boxes, severity table, provenance.
+- **Field Engineer Copilot** – structured `WorkOrder` generation, root-cause chat with tool-calling, **PDF / JSON export**, optional save to Cloud Storage.
+- **Resilience** – timeouts, 2 retries with exponential backoff on 429/5xx, validation-retry, visible fallback.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph PLANT["Plant (simulated in this prototype)"]
+        TEL["Telemetry generator<br/>vibration · temp · current · RPM · acoustic"]
+        IMG["Component images"]
+    end
+    TEL --> DET["Anomaly detector<br/>+ failure-mode classifier"]
+    IMG --> VIS["Vision inspector"]
+    DET --> COP["Maintenance copilot<br/>structured WorkOrder + chat tools"]
+    VIS --> COP
+    GEM[("Gemini on Vertex AI")]
+    VIS <--> GEM
+    COP <--> GEM
+    COP --> WO["Work order PDF / JSON"]
+    UI["Streamlit dashboard on Cloud Run"]
+    DET --> UI
+    VIS --> UI
+    COP --> UI
+    WO --> UI
+    GCS[("Cloud Storage")]
+    BQ[("BigQuery")]
+    WO --> GCS
+    IMG --> GCS
+    DET --> BQ
+    COP --> BQ
+    BQ --> UI
+    subgraph PROD["Production path (designed, not built)"]
+        PLC["PLC / OPC-UA"] -.-> PS["Pub/Sub"] -.-> DF["Dataflow"] -.-> BQ
+    end
 ```
-telemetry.py  → signal synthesis + AnomalyDetector
-inspector.py  → Gemini vision pipeline, annotation, sample-image generator
-copilot.py    → SOP/parts knowledge base, structured triage, chat tools, PDF/JSON export
-app.py        → Streamlit dashboard (4 tabs)
-```
+Details and data flow: [docs/architecture.md](docs/architecture.md).
 
-## Offline demo mode
-With **no credentials** the app runs fully offline: a deterministic rule engine replaces Gemini and the bundled sample images carry embedded ground truth. A badge in the sidebar shows the active mode. Live Gemini failures also fall back to the mock automatically.
+## Google Cloud services
 
-## Run locally
+| Service | Role | Status in this repo |
+|---|---|---|
+| **Vertex AI (Gemini)** | Vision inspection, structured triage, tool-calling chat (`google-genai` SDK, `gemini-2.5-flash`) | Implemented; verify with `scripts/preflight.py` |
+| **Cloud Run** | Hosts the Streamlit app (2 vCPU / 2 GiB, min 1 instance, session affinity) | Implemented; `deploy.sh` |
+| **Cloud Storage** | Inspection images, exported work-order PDF/JSON (`FACTORYPULSE_GCS_BUCKET`) | Implemented, optional |
+| **BigQuery** | Telemetry snapshots, anomaly flags, work orders + 3 analytics queries (`FACTORYPULSE_BQ_DATASET`) | Implemented, optional |
+| **Cloud Build / Artifact Registry** | Build from source during `gcloud run deploy --source .` | Used by `deploy.sh` |
+| **Pub/Sub → Dataflow → BigQuery** | Real streaming ingestion from PLC/OPC-UA | **Designed only** (production path) |
+
+## Quick start (local, no credentials needed)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py          # http://localhost:8501
+streamlit run app.py          # http://localhost:8501  (sidebar badge shows OFFLINE MOCK)
 ```
 
-### Option A – Gemini Developer API key
-```bash
-export GEMINI_API_KEY="your-key"
-```
+With no credentials the app runs on a deterministic rule engine and says so everywhere (`mock` provenance). Cloud Run never does this: when `K_SERVICE` is set the app resolves to Vertex AI.
 
-### Option B – Vertex AI (recommended for Cloud Run)
+### Authenticate to Vertex AI
+
 ```bash
+gcloud auth login
 gcloud auth application-default login
-gcloud config set project YOUR_PROJECT_ID
 gcloud services enable aiplatform.googleapis.com
-
-export GOOGLE_GENAI_USE_VERTEXAI=true
-export GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID
-export GOOGLE_CLOUD_LOCATION=us-central1
+export GOOGLE_GENAI_USE_VERTEXAI=true GOOGLE_CLOUD_PROJECT=YOUR_PROJECT GOOGLE_CLOUD_LOCATION=us-central1
+python scripts/preflight.py        # one REAL call each: vision, structured triage, tool-calling chat
+streamlit run app.py               # badge: VERTEX AI
 ```
+`preflight.py` prints a PASS/FAIL table (provenance, latency, exact error text) and exits non-zero on failure. Alternatively use a Gemini API key: `export GEMINI_API_KEY=...`.
 
-Optional: `GEMINI_MODEL` (default `gemini-2.5-flash`; try `gemini-2.5-pro` for harder images), `FACTORYPULSE_FORCE_MOCK=1` to force offline mode.
-
-## Run with Docker
-```bash
-docker build -t factorypulse .
-docker run --rm -p 8080:8080 factorypulse                       # offline demo
-docker run --rm -p 8080:8080 -e GEMINI_API_KEY=... factorypulse # live Gemini
-```
-
-## Deploy to Google Cloud Run
+## Deploy to Cloud Run
 
 ```bash
-export PROJECT_ID=YOUR_PROJECT_ID REGION=us-central1 SERVICE=factorypulse
-
-gcloud config set project $PROJECT_ID
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
-    cloudbuild.googleapis.com aiplatform.googleapis.com
-
-# Dedicated service account with Vertex AI access (no keys needed on Cloud Run)
-gcloud iam service-accounts create factorypulse-sa --display-name "FactoryPulse"
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member "serviceAccount:factorypulse-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role roles/aiplatform.user
-
-# Build from source and deploy
-gcloud run deploy $SERVICE \
-    --source . \
-    --region $REGION \
-    --service-account factorypulse-sa@$PROJECT_ID.iam.gserviceaccount.com \
-    --port 8080 \
-    --memory 1Gi --cpu 1 \
-    --min-instances 0 --max-instances 3 \
-    --session-affinity \
-    --set-env-vars GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION \
-    --allow-unauthenticated   # remove for private/IAP-protected access
+./deploy.sh YOUR_PROJECT_ID us-central1      # or PROJECT_ID=... REGION=... ./deploy.sh
+./scripts/smoke_test.sh <service-url>
 ```
+`deploy.sh` is idempotent: enables APIs, creates the `factorypulse-sa` service account (`aiplatform.user`, `bigquery.dataEditor`, `bigquery.jobUser`, bucket-scoped `storage.objectAdmin`), creates the bucket and BigQuery dataset, deploys from source (`--allow-unauthenticated --memory 2Gi --cpu 2 --timeout 3600 --min-instances 1`), creates a `factorypulse-preflight` Cloud Run job, and prints the URL. It never sets `FACTORYPULSE_FORCE_MOCK`. Step-by-step with expected output: [DEPLOY_CHECKLIST.md](DEPLOY_CHECKLIST.md).
 
-`--session-affinity` keeps a browser's Streamlit websocket on the same instance. For a Developer-API key instead of Vertex, store it in Secret Manager and use `--set-secrets GEMINI_API_KEY=gemini-key:latest`.
+## Environment variables
 
-## Demo script (3 minutes)
-1. **System Overview** – fleet with one critical bearing, one thermal overload, one cavitating pump.
-2. **Telemetry Explorer** – pick `PUMP-101`, inject *Inner race bearing defect*, toggle *Live stream replay* and watch anomaly markers appear and the detector classify the mode.
-3. **Visual QA Lab** – inspect the *weld* sample, attach it to `MTR-201`: Gemini boxes a branching fatigue crack (CRITICAL).
-4. **Copilot** – run triage for `MTR-201`: telemetry + crack → CRITICAL work order with part numbers and LOTO steps. Ask "Which parts do I need?" then export the PDF.
+| Variable | Default | Purpose |
+|---|---|---|
+| `GOOGLE_GENAI_USE_VERTEXAI` | – | `true` → use Vertex AI (ADC / service account) |
+| `GOOGLE_CLOUD_PROJECT` | from ADC | GCP project for Vertex AI, BigQuery, Storage |
+| `GOOGLE_CLOUD_LOCATION` | `us-central1` | Vertex AI region |
+| `GEMINI_API_KEY` | – | Gemini Developer API instead of Vertex |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Model id |
+| `FACTORYPULSE_LLM_TIMEOUT_S` | `60` | Per-call timeout |
+| `FACTORYPULSE_GCS_BUCKET` | – | Save images and work orders to this bucket |
+| `FACTORYPULSE_BQ_DATASET` | – | Log to / query BigQuery (`dataset` or `project.dataset`) |
+| `FACTORYPULSE_BQ_LOCATION` | `US` | BigQuery dataset location |
+| `FACTORYPULSE_FORCE_MOCK` | – | `1` forces offline mode (tests/dev only) |
+| `K_SERVICE` | set by Cloud Run | Forces Vertex resolution; never defaults to mock |
 
-## Design notes
-- **Structured output vs. tools:** Gemini cannot combine a JSON response schema with function calling in one request, so triage uses `response_schema=WorkOrder` with retrieved SOPs injected into the prompt, while the chat copilot uses automatic function calling (`lookup_sop`, `lookup_spare_part`, `get_machine_status`).
-- **Safety guardrails:** after the model responds, deterministic floors prevent under‑rating (e.g. a CRITICAL telemetry status can never yield a LOW work order; HIGH/CRITICAL work forces LOTO).
-- Telemetry is simulated; replace `generate_telemetry` with an OPC UA / Pub/Sub / BigQuery reader for production use. The SOP library in `copilot.py` is illustrative — swap in Vertex AI Search / RAG over your real documents.
+See [.env.example](.env.example).
+
+## Real-data validation (CWRU bearing dataset)
+
+`python scripts/validate_real_bearing_data.py` downloads 16 public recordings from the [Case Western Reserve University Bearing Data Center](https://engineering.case.edu/bearingdatacenter/download-data-file) (normal baseline + inner-race faults, 3 diameters × 4 motor loads) and runs the **untuned default detector** on 50 ms window-RMS features. Results from the run committed in `reports/validation_cwru.json`:
+
+| Metric (window level, 12 fault streams) | Value |
+|---|---|
+| Fault detected | **12 / 12** streams, first window |
+| Recall | **100 %** (2434 TP, 0 FN) |
+| Precision | **74.1 %** (849 FP) |
+| F1 | 85.1 % |
+| False alarms on held-out *normal*, same motor load as baseline | **0 / 1215** |
+| False alarms on held-out *normal*, different motor load | **849 / 6345 (13.4 %)** |
+
+Read this honestly: inner-race faults at 0.007–0.021″ on this rig are large changes in RMS, so detection is easy; the real finding is that a **fixed healthy baseline is load-sensitive** (normal data at another load looks anomalous). Production use would need load-conditioned baselines. Windows are autocorrelated, so these are not independent samples. The panel in the Telemetry tab shows the same numbers plus method and limitations.
+
+## Honest limitations
+- **Telemetry, SOPs, part numbers, plant assets and cost figures are synthetic.** The impact panel is driven by editable *assumptions*, not measurements.
+- The CWRU check covers **one sensor, one rig, one fault type** (inner race), uses acceleration RMS rescaled to nominal (not calibrated velocity), and cannot validate thermal-overload or cavitation detection.
+- The detector's failure-mode classifier is rule-based and was developed on the simulator; it is not validated on real thermal/cavitation data.
+- Gemini bounding boxes and severities are model outputs without a labelled benchmark here; real defect images (NEU / MVTec AD) are supported through `sample_images/` but no accuracy figures are claimed. Offline mock results on real photos are placeholders.
+- Streamlit session state is per browser tab; the in-memory analytics fallback is not persisted.
+- Streaming ingestion (Pub/Sub → Dataflow) is a documented design, not implemented.
+- Not a certified safety system; do not use for real maintenance decisions.
+
+## 3-minute demo script
+
+| Time | Action | Say |
+|---|---|---|
+| 0:00 | Open the URL; point at the sidebar **VERTEX AI** badge | "Live Gemini on Vertex AI, running on Cloud Run." |
+| 0:15 | **Overview**: fleet cards, alerts | "Six assets; a cavitating pump, a bearing and a thermal-overload motor are already flagged." |
+| 0:35 | Click **▶ Run demo scenario** | "One click: inject an inner-race fault on PUMP-101…" |
+| 0:50 | Watch the five progress steps | "…the detector flags it, Gemini inspects the bearing image, and a work order is generated." |
+| 1:15 | **Telemetry Explorer** → PUMP-101, toggle *Live stream replay* | "Vibration spikes, temperature rising; red X markers are anomaly flags; the detector attributes it to an inner-race defect." |
+| 1:45 | **Visual QA Lab** → inspect the *weld* sample | "Gemini finds and boxes a branching fatigue crack — CRITICAL — with a provenance badge." |
+| 2:10 | **Copilot** → Run AI triage; show criticality, parts, LOTO | "Structured output, SOP-grounded; note the safety-floor message if the model under-rates." |
+| 2:30 | Ask "Which parts do I need?" (tool-calling chat) | "It looks up the SOP and parts catalogue via function calling." |
+| 2:45 | Export PDF; show gs:// path and **Fleet analytics** | "Saved to Cloud Storage, logged to BigQuery, queried here." |
+| 2:55 | Open **Real Data Validation** | "And we validated the detector on the public CWRU dataset — including where it falls short." |
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q          # 59 tests, offline, mock mode, no network or credentials
+```
+Covers detector per fault mode, bbox conversion and malformed boxes, `WorkOrder` validation, safety floors, retry/backoff and provenance labelling (fake Gemini clients), GCS/BigQuery logic (fakes), the validation pipeline (synthetic arrays), and end-to-end UI flows via Streamlit `AppTest`. Live Vertex AI, Cloud Run, BigQuery and GCS behaviour is checked by `scripts/preflight.py` and `scripts/smoke_test.sh`, not by the unit tests.
+
+## Repository layout
+
+```
+app.py            Streamlit UI (4 tabs)            llm.py          client config, provenance, retries
+telemetry.py      simulator + AnomalyDetector      cloud.py        GCS + BigQuery (+ local fallback)
+inspector.py      Gemini vision + boxes + samples  diagnostics.py  live-path self-test (used by preflight)
+copilot.py        triage, chat tools, PDF/JSON     impact.py       assumption-based impact maths
+scripts/          preflight, smoke_test, CWRU validation      deploy.sh   Cloud Run deployment
+```
