@@ -18,7 +18,7 @@ fail() { echo "FAIL  $*"; FAIL=1; }
 
 # 1. Streamlit health endpoint
 HEALTH="$(curl -fsS --max-time 20 "${URL}/_stcore/health" 2>&1)"
-[[ "${HEALTH}" == "ok" ]] && pass "/_stcore/health -> ok" || fail "/_stcore/health -> '${HEALTH}'"
+if [[ "${HEALTH}" == "ok" ]]; then pass "/_stcore/health -> ok"; else fail "/_stcore/health -> '${HEALTH}'"; fi
 
 # 2. Index page is served
 CODE="$(curl -s -o /tmp/fp_index.html -w '%{http_code}' --max-time 20 "${URL}/")"
@@ -28,7 +28,7 @@ if [[ "${CODE}" == "200" ]] && grep -qi "streamlit" /tmp/fp_index.html; then pas
 WS="$(curl -s --http1.1 -i --max-time 6 -o - "${URL}/_stcore/stream" \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==' -H "Origin: ${URL}" 2>/dev/null | head -1)"
-[[ "${WS}" == *"101"* ]] && pass "websocket upgrade -> 101" || fail "websocket upgrade -> '${WS:-no response}'"
+if [[ "${WS}" == *"101"* ]]; then pass "websocket upgrade -> 101"; else fail "websocket upgrade -> '${WS:-no response}'"; fi
 
 # 4. Live-Gemini preflight inside Cloud Run (if the job exists and gcloud is authenticated)
 if command -v gcloud >/dev/null 2>&1 && gcloud run jobs describe "${SERVICE}-preflight" --region "${REGION}" >/dev/null 2>&1; then

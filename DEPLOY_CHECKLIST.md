@@ -39,6 +39,7 @@ model not available in the region -> try `GOOGLE_CLOUD_LOCATION=us-central1` or 
 **Do not deploy until this is green** - otherwise the public demo will show `fallback (...)` badges.
 
 ## 4. Deploy
+Preview every command first (touches nothing): `DRY_RUN=1 ./deploy.sh $PROJECT_ID $REGION`
 ```bash
 chmod +x deploy.sh scripts/smoke_test.sh
 ./deploy.sh $PROJECT_ID $REGION
