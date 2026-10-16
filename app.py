@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import uuid
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +24,7 @@ from copilot import (
 )
 import cloud
 from diagnostics import describe_environment, run_preflight
+from impact import ImpactAssumptions, estimate_impact
 from inspector import (
     SAMPLE_KINDS,
     SEVERITY_RANK,
@@ -29,6 +32,7 @@ from inspector import (
     annotate_image,
     box_to_pixels,
     inspect_image,
+    list_sample_gallery,
     make_sample_image,
 )
 from llm import Provenance, get_model, llm_status, on_cloud_run
@@ -108,8 +112,8 @@ if "initialized" not in st.session_state:
     st.session_state.store = cloud.make_store()
     st.session_state.logged_keys = set()
     for m in FLEET:
-        st.session_state[f"mode_{m['id']}"] = m["mode"].value
-        st.session_state[f"sev_{m['id']}"] = 1.0
+        st.session_state[f"cfg_mode_{m['id']}"] = m["mode"].value
+        st.session_state[f"cfg_sev_{m['id']}"] = 1.0
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -122,8 +126,8 @@ def machine_data(mode: str, severity: float, seed: int, n_samples: int, t0: str)
 def current_data(machine_id: str):
     m = FLEET_BY_ID[machine_id]
     return machine_data(
-        st.session_state[f"mode_{machine_id}"],
-        float(st.session_state[f"sev_{machine_id}"]),
+        st.session_state[f"cfg_mode_{machine_id}"],
+        float(st.session_state[f"cfg_sev_{machine_id}"]),
         m["seed"] + st.session_state.seed_bump,
         int(st.session_state.dur_min) * 12,
         st.session_state.t0,
@@ -181,7 +185,7 @@ def log_fleet_once() -> None:
     flags: List[dict] = []
     for m in FLEET:
         mid = m["id"]
-        key = (mid, st.session_state[f"mode_{mid}"], float(st.session_state[f"sev_{mid}"]),
+        key = (mid, st.session_state[f"cfg_mode_{mid}"], float(st.session_state[f"cfg_sev_{mid}"]),
                st.session_state.seed_bump, st.session_state.dur_min)
         if key in seen:
             continue
@@ -248,6 +252,122 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+ROOT_DIR = Path(__file__).resolve().parent
+GALLERY_DIR = ROOT_DIR / "sample_images"
+VALIDATION_PATH = ROOT_DIR / "reports" / "validation_cwru.json"
+DEMO_MACHINE = "PUMP-101"
+
+
+def prepare_image(data: bytes, max_side: int = 2048) -> bytes:
+    """Downscale very large uploads to control token cost; leave small images untouched."""
+    img = Image.open(io.BytesIO(data))
+    if max(img.size) <= max_side:
+        return data
+    img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+def sig_for(machine_id: str) -> str:
+    insp = st.session_state.inspections.get(machine_id)
+    raw = f"{st.session_state[f'cfg_mode_{machine_id}']}|{st.session_state[f'cfg_sev_{machine_id}']}|{st.session_state.seed_bump}|{st.session_state.dur_min}|"
+    raw += hashlib.md5(str(insp["report"]).encode()).hexdigest() if insp else "none"
+    return raw
+
+
+def sync_fault_cfg(machine_id: str) -> None:
+    """Copy widget values into plain state keys (widget keys vanish when their widget is not rendered)."""
+    st.session_state[f"cfg_mode_{machine_id}"] = st.session_state[f"w_mode_{machine_id}"]
+    st.session_state[f"cfg_sev_{machine_id}"] = st.session_state[f"w_sev_{machine_id}"]
+
+
+def run_inspection(machine_id: str, image_bytes: bytes, hint: str = "") -> Dict[str, Any]:
+    """Inspect an image, annotate it, save to GCS (if enabled) and attach it to the machine."""
+    report_obj, prov = inspect_image(image_bytes, hint, use_mock=use_mock)
+    annotated = annotate_image(image_bytes, report_obj)
+    buf = io.BytesIO()
+    annotated.save(buf, format="PNG")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    gcs_paths = {
+        "original": gcs_save(f"inspections/{machine_id}/{stamp}_original.png", image_bytes, "image/png"),
+        "annotated": gcs_save(f"inspections/{machine_id}/{stamp}_annotated.png", buf.getvalue(), "image/png"),
+    }
+    rec = {
+        "report": report_obj.model_dump(mode="json"), "prov": prov.to_dict(), "original": image_bytes,
+        "annotated": buf.getvalue(), "gcs": gcs_paths, "at": datetime.now().strftime("%H:%M:%S"),
+    }
+    st.session_state.inspections[machine_id] = rec
+    st.session_state.work_orders.pop(machine_id, None)
+    return rec
+
+
+def run_triage(machine_id: str, include_inspection: bool = True) -> Dict[str, Any]:
+    """Generate the work order, build PDF/JSON once, save to GCS and log to the store."""
+    _, _, anomaly = current_data(machine_id)
+    insp_rec = st.session_state.inspections.get(machine_id)
+    inspection_obj = InspectionReport.model_validate(insp_rec["report"]) if (insp_rec and include_inspection) else None
+    wo, prov = generate_work_order(machine_id, anomaly, inspection_obj, use_mock=use_mock)
+    meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "provenance": prov.label,
+            "provenance_detail": prov.to_dict(), "safety_notes": prov.notes,
+            "telemetry_status": anomaly["status"], "inspection_attached": inspection_obj is not None}
+    pdf_bytes, json_text = work_order_to_pdf(wo, meta), work_order_to_json(wo, meta)
+    pdf_uri = gcs_save(f"work_orders/{wo.incident_id}.pdf", pdf_bytes, "application/pdf")
+    json_uri = gcs_save(f"work_orders/{wo.incident_id}.json", json_text.encode(), "application/json")
+    st.session_state.store.insert("work_orders", [
+        cloud.build_work_order_row(st.session_state.session_id, wo, prov.to_dict(), pdf_uri, json_uri)])
+    rec = {"wo": wo, "prov": prov.to_dict(), "sig": sig_for(machine_id), "meta": meta,
+           "pdf": pdf_bytes, "json": json_text, "gcs": {"pdf": pdf_uri, "json": json_uri}}
+    st.session_state.work_orders[machine_id] = rec
+    return rec
+
+
+def run_demo_scenario() -> None:
+    """Golden path for the demo video: fault -> anomaly -> inspection -> work order -> PDF export."""
+    log: List[str] = []
+    with st.status("Running demo scenario...", expanded=True) as status:
+        bar = st.progress(0, text="Step 1/5 - injecting inner-race bearing fault")
+        mid = DEMO_MACHINE
+        st.session_state[f"cfg_mode_{mid}"] = FaultMode.BEARING_INNER_RACE.value
+        st.session_state[f"cfg_sev_{mid}"] = 1.2
+        for wk in (f"w_mode_{mid}", f"w_sev_{mid}"):
+            st.session_state.pop(wk, None)  # let the widgets re-initialise from cfg_*
+        for k in ("explorer_machine", "qa_machine", "cp_machine"):
+            st.session_state[k] = mid
+        st.session_state["qa_source"] = "bearing"
+        log.append(f"1. Injected **inner race bearing defect** (severity 1.2) on {mid}.")
+        st.write("✅ " + log[-1])
+
+        bar.progress(20, text="Step 2/5 - running anomaly detector")
+        _, _, rep = current_data(mid)
+        top = rep["findings"][0]["message"] if rep["findings"] else "no findings"
+        log.append(f"2. Detector status **{rep['status']}**, suspected **{fmt_mode(rep['suspected_mode'])}** "
+                   f"({rep['mode_confidence']:.0%}); {len(rep['findings'])} finding(s). First: {top}")
+        st.write("✅ " + log[-1])
+
+        bar.progress(40, text="Step 3/5 - visual inspection of bearing image")
+        rec = run_inspection(mid, make_sample_image("bearing"), "demo scenario: bearing race close-up")
+        log.append(f"3. Visual inspection: **{rec['report']['overall_condition']}**, {len(rec['report']['defects'])} defect(s) "
+                   f"[{rec['prov']['label']}].")
+        st.write("✅ " + log[-1])
+
+        bar.progress(65, text="Step 4/5 - generating work order")
+        wrec = run_triage(mid, True)
+        wo = wrec["wo"]
+        log.append(f"4. Work order **{wo.incident_id}**: criticality **{wo.criticality}**, RUL "
+                   f"{wo.estimated_remaining_useful_life_hours:.1f} h, LOTO {'required' if wo.loto_procedure_required else 'not required'} "
+                   f"[{wrec['prov']['label']}].")
+        st.write("✅ " + log[-1])
+
+        bar.progress(90, text="Step 5/5 - preparing PDF export")
+        log.append(f"5. PDF export ready ({len(wrec['pdf']) // 1024} KB) - download below or in the Copilot tab.")
+        st.write("✅ " + log[-1])
+        bar.progress(100, text="Demo scenario complete")
+        status.update(label="Demo scenario complete", state="complete", expanded=False)
+    st.session_state.demo_log = log
+    st.session_state.demo_machine = mid
+
+
 tab_overview, tab_telemetry, tab_qa, tab_copilot = st.tabs(
     ["📊 System Overview", "📈 Telemetry Anomaly Explorer", "🔍 Visual QA Lab", "🛠️ Field Engineer Copilot"]
 )
@@ -257,6 +377,25 @@ tab_overview, tab_telemetry, tab_qa, tab_copilot = st.tabs(
 # Tab 1: Overview
 # --------------------------------------------------------------------------- #
 with tab_overview:
+    with st.container(border=True):
+        d1, d2 = st.columns([1, 3])
+        clicked = d1.button("▶ Run demo scenario", type="primary", use_container_width=True,
+                            help="Golden path: inject fault -> detect -> inspect -> work order -> PDF")
+        d2.caption(f"One click runs the 3-minute video flow on **{DEMO_MACHINE}**: inject an inner-race bearing fault, "
+                   "show the anomaly flag, inspect a bearing image, generate the work order and enable PDF export.")
+        if clicked:
+            run_demo_scenario()
+        if st.session_state.get("demo_log"):
+            with st.expander("Last demo scenario result", expanded=not clicked):
+                for line in st.session_state.demo_log:
+                    st.markdown(line)
+                wrec = st.session_state.work_orders.get(st.session_state.demo_machine)
+                if wrec:
+                    x1, x2, _ = st.columns([1, 1, 2])
+                    x1.download_button("📄 Download PDF", wrec["pdf"], file_name=f'{wrec["wo"].incident_id}.pdf',
+                                       mime="application/pdf", key="demo_pdf")
+                    x2.download_button("🧾 Download JSON", wrec["json"], file_name=f'{wrec["wo"].incident_id}.json',
+                                       mime="application/json", key="demo_json")
     reports = fleet_reports()
     log_fleet_once()
     show_store_warnings()
@@ -380,6 +519,26 @@ with tab_overview:
         else:
             st.info("No work orders generated yet.")
 
+    # ---- Impact panel (assumption-driven) ------------------------------------------------------ #
+    st.subheader("Estimated impact (illustrative assumptions - not measured data)")
+    with st.expander("Edit assumptions", expanded=False):
+        i1, i2, i3 = st.columns(3)
+        cost = i1.number_input("Downtime cost per hour, USD (assumption)", 0.0, 1_000_000.0, 8000.0, 500.0)
+        unplanned = i1.number_input("Unplanned failure downtime, h (assumption)", 0.0, 500.0, 12.0, 1.0)
+        planned = i2.number_input("Planned repair downtime, h (assumption)", 0.0, 500.0, 3.0, 1.0)
+        lead = i2.number_input("Detection lead time before failure, h (assumption)", 0.0, 720.0, 36.0, 1.0)
+        window = i3.number_input("Crew planning window needed, h (assumption)", 0.0, 168.0, 8.0, 1.0)
+        pprev = i3.slider("Share of acted-on alerts that prevent failure (assumption)", 0.0, 1.0, 0.8, 0.05)
+    impact = estimate_impact({mid: r["status"] for mid, r in reports.items()},
+                             ImpactAssumptions(cost, unplanned, planned, lead, window, pprev))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Assets with active alerts", len(impact["rows"]))
+    m2.metric("Downtime avoided (assumption-based)", f'{impact["total_hours"]:.1f} h')
+    m3.metric("Cost avoided (assumption-based)", f'${impact["total_cost"]:,.0f}')
+    st.caption("**Assumption, not measurement:** estimate = (unplanned downtime − planned downtime) × P(prevented) × cost/h, "
+               "counted per currently-alerting asset, and only if the assumed detection lead time covers the crew planning window. "
+               "No real plant data or production outcomes were used.")
+
 
 # --------------------------------------------------------------------------- #
 # Tab 2: Telemetry explorer
@@ -447,9 +606,11 @@ with tab_telemetry:
         machine_id = st.selectbox("Machine", [m["id"] for m in FLEET], key="explorer_machine",
                                   format_func=lambda i: f"{i} · {FLEET_BY_ID[i]['name']}")
     with c2:
-        st.radio("Fault injection", MODE_OPTIONS, key=f"mode_{machine_id}", horizontal=True, format_func=fmt_mode)
+        st.radio("Fault injection", MODE_OPTIONS, index=MODE_OPTIONS.index(st.session_state[f"cfg_mode_{machine_id}"]),
+                 key=f"w_mode_{machine_id}", horizontal=True, format_func=fmt_mode, on_change=sync_fault_cfg, args=(machine_id,))
     with c3:
-        st.slider("Fault severity", 0.3, 2.0, step=0.1, key=f"sev_{machine_id}")
+        st.slider("Fault severity", 0.3, 2.0, value=float(st.session_state[f"cfg_sev_{machine_id}"]), step=0.1,
+                  key=f"w_sev_{machine_id}", on_change=sync_fault_cfg, args=(machine_id,))
     with c4:
         st.selectbox("Window (min)", [30, 60, 120], key="dur_min")
 
@@ -492,54 +653,71 @@ with tab_telemetry:
         st.download_button("⬇ Download telemetry CSV", df.to_csv(index=False).encode(),
                            file_name=f"{machine_id}_telemetry.csv", mime="text/csv")
 
+    with st.expander("🧪 Real Data Validation - CWRU bearing dataset", expanded=False):
+        if VALIDATION_PATH.exists():
+            val = json.loads(VALIDATION_PATH.read_text())
+            ag = val["aggregate"]
+            pct = lambda v: "n/a" if v is None else f"{v:.1%}"  # noqa: E731
+            st.caption(f'{val["dataset"]} · generated {val["generated_at"]} · [source]({val["source_url"]})')
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Precision", pct(ag["precision"]))
+            v2.metric("Recall", pct(ag["recall"]))
+            v3.metric("F1", pct(ag["f1"]))
+            v4.metric("False-positive rate", pct(ag["false_positive_rate"]))
+            st.markdown(
+                f'Detector caught the fault in **{ag["streams_with_detection"]}/{ag["streams"]}** inner-race streams. '
+                f'False alarms on held-out *normal* windows: **{ag["fp_same_load"]}/{ag["heldout_same_load"]}** at the baseline\'s '
+                f'own motor load, but **{ag["fp_other_load"]}/{ag["heldout_other_load"]}** when the load differs - the fixed baseline '
+                "is load-sensitive.")
+            sdf = pd.DataFrame(val["streams"])[["fault", "load_hp", "precision", "recall", "false_positive_rate",
+                                                "fp_same_load", "fp_other_load", "detection_delay_ms"]]
+            st.dataframe(sdf, hide_index=True, use_container_width=True)
+            st.markdown("**Method and limitations**")
+            with st.container():
+                st.json(val["method"])
+                for lim in val["limitations"]:
+                    st.markdown(f"- {lim}")
+                for n in val.get("notes", []):
+                    st.markdown(f"- note: {n}")
+        else:
+            st.info("No validation results found. Run `python scripts/validate_real_bearing_data.py` "
+                    "(downloads the public CWRU files, or use `--data-dir`) to generate `reports/validation_cwru.json`.")
+
 
 # --------------------------------------------------------------------------- #
 # Tab 3: Visual QA lab
 # --------------------------------------------------------------------------- #
-def prepare_image(data: bytes, max_side: int = 2048) -> bytes:
-    """Downscale very large uploads to control token cost; leave small images untouched."""
-    img = Image.open(io.BytesIO(data))
-    if max(img.size) <= max_side:
-        return data
-    img.thumbnail((max_side, max_side))
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=92)
-    return buf.getvalue()
-
-
 with tab_qa:
     st.caption("Gemini multimodal reasoning detects, localizes and classifies defects, returning bounding boxes in a strict schema.")
     q1, q2 = st.columns([1, 2.2])
     with q1:
         qa_machine = st.selectbox("Associate with machine", [m["id"] for m in FLEET], key="qa_machine",
                                   format_func=lambda i: f"{i} · {FLEET_BY_ID[i]['name']}")
-        source_choice = st.radio("Image source", list(SAMPLE_KINDS) + ["upload"], key="qa_source",
-                                 format_func=lambda k: "Upload your own image" if k == "upload" else f"Sample - {SAMPLE_KINDS[k]}")
+        gallery = list_sample_gallery(GALLERY_DIR)
+        source_choice = st.radio(
+            "Image source", list(SAMPLE_KINDS) + ["gallery", "upload"], key="qa_source",
+            format_func=lambda k: {"upload": "Upload your own image",
+                                   "gallery": f"Sample gallery - real images ({len(gallery)} in sample_images/)"}.get(
+                k, f"Synthetic - {SAMPLE_KINDS.get(k, k)}"))
         uploaded = st.file_uploader("Component image", type=["png", "jpg", "jpeg", "webp"]) if source_choice == "upload" else None
+        gallery_pick = None
+        if source_choice == "gallery":
+            if gallery:
+                gallery_pick = st.selectbox("Gallery image", gallery)
+            else:
+                st.info("`sample_images/` has no images yet - see `sample_images/README.md` for NEU / MVTec AD instructions.")
         hint = st.text_input("Operator context (optional)", placeholder="e.g. weld on pump baseplate, 3rd shift")
         image_bytes: Optional[bytes] = None
         if source_choice == "upload":
             image_bytes = prepare_image(uploaded.getvalue()) if uploaded else None
+        elif source_choice == "gallery":
+            image_bytes = prepare_image((GALLERY_DIR / gallery_pick).read_bytes()) if gallery_pick else None
         else:
             image_bytes = make_sample_image(source_choice)
         run = st.button("🔍 Run visual inspection", type="primary", use_container_width=True, disabled=image_bytes is None)
         if run and image_bytes:
             with st.spinner("Analyzing image with Gemini..." if not use_mock else "Analyzing image (offline mock)..."):
-                report_obj, prov = inspect_image(image_bytes, hint, use_mock=use_mock)
-            annotated = annotate_image(image_bytes, report_obj)
-            buf = io.BytesIO()
-            annotated.save(buf, format="PNG")
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            gcs_paths = {
-                "original": gcs_save(f"inspections/{qa_machine}/{stamp}_original.png", image_bytes, "image/png"),
-                "annotated": gcs_save(f"inspections/{qa_machine}/{stamp}_annotated.png", buf.getvalue(), "image/png"),
-            }
-            st.session_state.inspections[qa_machine] = {
-                "report": report_obj.model_dump(mode="json"), "prov": prov.to_dict(),
-                "original": image_bytes, "annotated": buf.getvalue(), "gcs": gcs_paths,
-                "at": datetime.now().strftime("%H:%M:%S"),
-            }
-            st.session_state.work_orders.pop(qa_machine, None)
+                run_inspection(qa_machine, image_bytes, hint)
 
     with q2:
         rec = st.session_state.inspections.get(qa_machine)
@@ -582,13 +760,6 @@ with tab_qa:
 # --------------------------------------------------------------------------- #
 # Tab 4: Copilot & work orders
 # --------------------------------------------------------------------------- #
-def sig_for(machine_id: str) -> str:
-    insp = st.session_state.inspections.get(machine_id)
-    raw = f"{st.session_state[f'mode_{machine_id}']}|{st.session_state[f'sev_{machine_id}']}|{st.session_state.seed_bump}|{st.session_state.dur_min}|"
-    raw += hashlib.md5(str(insp["report"]).encode()).hexdigest() if insp else "none"
-    return raw
-
-
 with tab_copilot:
     p1, p2 = st.columns([1, 1.1])
     with p1:
@@ -612,21 +783,8 @@ with tab_copilot:
                         unsafe_allow_html=True)
 
         if st.button("⚡ Run AI triage & generate work order", type="primary", use_container_width=True):
-            inspection_obj = InspectionReport.model_validate(insp_rec["report"]) if (insp_rec and include_insp) else None
             with st.spinner("Correlating telemetry, vision and SOPs..."):
-                wo, prov = generate_work_order(cp_machine, anomaly, inspection_obj, use_mock=use_mock)
-            meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "provenance": prov.label,
-                         "provenance_detail": prov.to_dict(), "safety_notes": prov.notes,
-                         "telemetry_status": anomaly["status"], "inspection_attached": inspection_obj is not None}
-            pdf_bytes, json_text = work_order_to_pdf(wo, meta), work_order_to_json(wo, meta)
-            pdf_uri = gcs_save(f"work_orders/{wo.incident_id}.pdf", pdf_bytes, "application/pdf")
-            json_uri = gcs_save(f"work_orders/{wo.incident_id}.json", json_text.encode(), "application/json")
-            st.session_state.store.insert("work_orders", [
-                cloud.build_work_order_row(st.session_state.session_id, wo, prov.to_dict(), pdf_uri, json_uri)])
-            st.session_state.work_orders[cp_machine] = {
-                "wo": wo, "prov": prov.to_dict(), "sig": sig_for(cp_machine), "meta": meta,
-                "pdf": pdf_bytes, "json": json_text, "gcs": {"pdf": pdf_uri, "json": json_uri},
-            }
+                run_triage(cp_machine, include_insp)
 
         rec_wo = st.session_state.work_orders.get(cp_machine)
         if rec_wo:
@@ -696,3 +854,9 @@ with tab_copilot:
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": answer, "prov": prov.to_dict()})
             st.rerun()
+
+
+st.divider()
+st.caption("⚠️ **Synthetic / illustrative data:** all telemetry, SOPs, spare-part numbers, plant assets and cost figures in this "
+           "demo are simulated or invented. Real-data validation uses the public CWRU bearing dataset only. "
+           "Not for use in real maintenance decisions.")

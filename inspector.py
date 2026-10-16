@@ -310,6 +310,16 @@ def annotate_image(image_bytes: bytes, report: InspectionReport) -> Image.Image:
     return img
 
 
+def list_sample_gallery(folder: Any) -> List[str]:
+    """Names of image files in the sample gallery folder (sorted, non-recursive)."""
+    from pathlib import Path
+
+    d = Path(folder)
+    if not d.is_dir():
+        return []
+    return sorted(f.name for f in d.iterdir() if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"})
+
+
 # --------------------------------------------------------------------------- #
 # Synthetic sample images (with embedded ground truth for the offline mock)
 # --------------------------------------------------------------------------- #
