@@ -1,7 +1,7 @@
 # FactoryPulse - submission draft
 
 **Track:** Manufacturing - Intelligent Operations & Industrial Efficiency
-**Live demo:** https://factorypulse-gnbcujjj5q-uc.a.run.app · **Repo:** `<fill in after publishing>` · **Video:** `<fill in>`
+**Live demo:** https://factorypulse-gnbcujjj5q-uc.a.run.app · **Repo:** https://github.com/venu13/factorypulse · **Video:** `<fill in>`
 
 ## Title
 FactoryPulse: Industrial Predictive Maintenance & Visual Inspection Copilot
