@@ -175,9 +175,9 @@ So **boxes are approximate**: strong on large features, weak on small or subtle 
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 59 tests, offline, mock mode, no network or credentials
+pytest -q          # 88 tests, offline, mock mode, no network or credentials
 ```
-Covers detector per fault mode, bbox conversion and malformed boxes, `WorkOrder` validation, safety floors, retry/backoff and provenance labelling (fake Gemini clients), GCS/BigQuery logic (fakes), the validation pipeline (synthetic arrays), and end-to-end UI flows via Streamlit `AppTest`. Live Vertex AI, Cloud Run, BigQuery and GCS behaviour is checked by `scripts/preflight.py` and `scripts/smoke_test.sh`, not by the unit tests.
+Covers detector per fault mode and false-alarm regression on healthy data, bbox conversion and malformed boxes, mode resolution (mock can never win when Vertex is configured), `WorkOrder` validation, safety floors, retry/backoff and provenance labelling (fake Gemini clients), GCS/BigQuery logic (fakes), the validation pipeline (synthetic arrays), and end-to-end UI flows via Streamlit `AppTest`. Live Vertex AI, Cloud Run, BigQuery and GCS behaviour is checked by `scripts/preflight.py` and `scripts/smoke_test.sh`, not by the unit tests.
 
 ## Repository layout
 
