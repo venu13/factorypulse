@@ -67,7 +67,7 @@ CHANNEL_COLOR = {
 st.markdown(
     f"""
 <style>
-.block-container {{ padding-top: 1.4rem; max-width: 1500px; }}
+.block-container {{ padding-top: 4rem; max-width: 1500px; }}
 h1, h2, h3 {{ letter-spacing: .02em; }}
 .fp-brand {{ font-size: 1.9rem; font-weight: 800; color: {AMBER}; letter-spacing: .08em; margin-bottom: 0; }}
 .fp-sub {{ color: #8B97A8; margin-top: -.2rem; margin-bottom: 1rem; font-size: .95rem; }}
