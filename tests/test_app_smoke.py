@@ -77,3 +77,24 @@ def test_demo_uses_weld_image_and_shows_per_call_progress(at):
 def test_qa_lab_states_localization_is_approximate(at, monkeypatch):
     from inspector import LOCALIZATION_NOTE
     assert "approximate" in LOCALIZATION_NOTE and "not calibrated" in LOCALIZATION_NOTE and "0.45" in LOCALIZATION_NOTE
+
+
+def test_fleet_card_flips_to_critical_after_demo(at):
+    """The fault injected by the demo must show up on the PUMP-101 fleet card in the same run."""
+    before = " ".join(m.value for m in at.markdown if "PUMP-101" in m.value and "fp-card" in m.value)
+    assert "HEALTHY" in before
+    _click(at, "Run demo scenario")
+    after = " ".join(m.value for m in at.markdown if "PUMP-101" in m.value and "fp-card" in m.value)
+    assert "CRITICAL" in after and "HEALTHY" not in after
+
+
+def test_healthy_demo_fleet_assets_show_no_warning(at):
+    cards = {m: " ".join(x.value for x in at.markdown if m in x.value and "fp-card" in x.value)
+             for m in ("PUMP-101", "PUMP-301", "FAN-401")}
+    assert all("HEALTHY" in v and "WARNING" not in v for v in cards.values()), cards
+
+
+def test_validation_panel_does_not_round_recall_up_to_100(at):
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Recall"] == "99.96%", metrics["Recall"]
+    assert metrics["Precision"] == "99.0%"

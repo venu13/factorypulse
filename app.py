@@ -674,7 +674,11 @@ with tab_telemetry:
         if VALIDATION_PATH.exists():
             val = json.loads(VALIDATION_PATH.read_text())
             ag = val["aggregate"]
-            pct = lambda v: "n/a" if v is None else f"{v:.1%}"  # noqa: E731
+            def pct(v):
+                """1-decimal percent, but never round a value below 1.0 up to '100.0%'."""
+                if v is None:
+                    return "n/a"
+                return f"{v:.2%}" if v < 1 and f"{v:.1%}" == "100.0%" else f"{v:.1%}"
             st.caption(f'{val["dataset"]} · generated {val["generated_at"]} · [source]({val["source_url"]})')
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("Precision", pct(ag["precision"]))
